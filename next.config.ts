@@ -13,6 +13,9 @@ const nextConfig: NextConfig = {
       },
     ],
   },
+  outputFileTracingIncludes: {
+    "/api/download": ["./bin/**"],
+  },
 };
 
 export default nextConfig;

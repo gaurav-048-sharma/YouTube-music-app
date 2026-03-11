@@ -1,12 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import { spawn, execFile } from "child_process";
 import { promisify } from "util";
+import { existsSync } from "fs";
+import path from "path";
 import { Innertube } from "youtubei.js";
 
 const execFileAsync = promisify(execFile);
 
+// Allow up to 60s for the download on Vercel (hobby plan max)
+export const maxDuration = 60;
+
 function getYtDlpPath(): string {
-  return process.env.YT_DLP_PATH || "yt-dlp";
+  // 1. Explicit env var (local dev)
+  if (process.env.YT_DLP_PATH) return process.env.YT_DLP_PATH;
+  // 2. Bundled binary (Vercel)
+  const bundled = path.join(process.cwd(), "bin", "yt-dlp");
+  if (existsSync(bundled)) return bundled;
+  // 3. System PATH
+  return "yt-dlp";
 }
 
 /**
@@ -69,36 +80,88 @@ function downloadWithYtDlp(
   });
 }
 
+// User-Agents matching the Innertube client types
+const CLIENT_USER_AGENTS: Record<string, string> = {
+  IOS: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+  ANDROID: "com.google.android.youtube/19.29.34 (Linux; U; Android 14) gzip",
+  WEB: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+};
+
 /**
- * Fallback: use youtubei.js IOS client for pre-signed URLs.
- * Works on Vercel but subject to YouTube's ~1MB throttle for some videos.
+ * Fallback: use youtubei.js to get audio stream URLs.
+ * Mobile clients (IOS/ANDROID) provide pre-signed URLs without needing
+ * player JS for signature deciphering.
  */
 async function resolveWithInnertube(videoId: string): Promise<{
   streamUrl: string;
   title: string;
   contentLength: number;
   mimeType: string;
+  clientUsed: string;
 } | null> {
+  // Mobile clients give pre-signed URLs — no player JS needed
+  const mobileClients = ["IOS", "ANDROID"] as const;
+
   const yt = await Innertube.create({
     retrieve_player: false,
     generate_session_locally: true,
   });
 
-  const info = await yt.getBasicInfo(videoId, { client: "IOS" });
+  for (const client of mobileClients) {
+    try {
+      console.log(`[innertube] trying ${client} client for ${videoId}`);
+      const info = await yt.getBasicInfo(videoId, { client });
 
-  const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
-    .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
-    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+      const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
+        .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
+        .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
 
-  if (audioFormats.length === 0) return null;
+      if (audioFormats.length === 0) {
+        console.log(`[innertube] ${client}: no audio formats with URLs`);
+        continue;
+      }
 
-  const fmt = audioFormats[0];
-  return {
-    streamUrl: fmt.url!,
-    title: info.basic_info.title ?? videoId,
-    contentLength: fmt.content_length ?? 0,
-    mimeType: fmt.mime_type ?? "audio/mp4",
-  };
+      const fmt = audioFormats[0];
+      console.log(`[innertube] ${client}: found itag=${fmt.itag} bitrate=${fmt.bitrate}`);
+      return {
+        streamUrl: fmt.url!,
+        title: info.basic_info.title ?? videoId,
+        contentLength: fmt.content_length ?? 0,
+        mimeType: fmt.mime_type ?? "audio/mp4",
+        clientUsed: client,
+      };
+    } catch (err) {
+      console.error(`[innertube] ${client} failed:`, err);
+      continue;
+    }
+  }
+
+  // Last resort: try WEB client with player retrieval (may fail on decipher)
+  try {
+    console.log(`[innertube] trying WEB client for ${videoId}`);
+    const webYt = await Innertube.create({ generate_session_locally: true });
+    const info = await webYt.getBasicInfo(videoId, { client: "WEB" });
+
+    const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
+      .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
+      .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+
+    if (audioFormats.length > 0) {
+      const fmt = audioFormats[0];
+      console.log(`[innertube] WEB: found itag=${fmt.itag} bitrate=${fmt.bitrate}`);
+      return {
+        streamUrl: fmt.url!,
+        title: info.basic_info.title ?? videoId,
+        contentLength: fmt.content_length ?? 0,
+        mimeType: fmt.mime_type ?? "audio/mp4",
+        clientUsed: "WEB",
+      };
+    }
+  } catch (err) {
+    console.error(`[innertube] WEB failed:`, err);
+  }
+
+  return null;
 }
 
 export async function GET(request: NextRequest) {
@@ -140,8 +203,7 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Strategy 2: Fallback to youtubei.js IOS client
-    console.log(`[innertube] trying IOS fallback for ${videoId}`);
+    // Strategy 2: Fallback to youtubei.js (multiple clients)
     const innertubeResult = await resolveWithInnertube(videoId);
 
     if (!innertubeResult) {
@@ -160,8 +222,15 @@ export async function GET(request: NextRequest) {
     const ext = isM4A ? "m4a" : "webm";
     const contentType = isM4A ? "audio/mp4" : "audio/webm";
 
+    // Must send User-Agent matching the client that requested the URL
+    const streamHeaders: Record<string, string> = {
+      "User-Agent": CLIENT_USER_AGENTS[innertubeResult.clientUsed] || CLIENT_USER_AGENTS.WEB,
+    };
+
     // Try plain fetch first
-    const directResponse = await fetch(innertubeResult.streamUrl);
+    const directResponse = await fetch(innertubeResult.streamUrl, {
+      headers: streamHeaders,
+    });
     if (directResponse.ok && directResponse.body) {
       return new NextResponse(directResponse.body, {
         status: 200,
@@ -175,22 +244,44 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // If plain fetch got 403, try with Range header
-    const rangeResponse = await fetch(innertubeResult.streamUrl, {
-      headers: { Range: `bytes=0-${innertubeResult.contentLength - 1}` },
-    });
+    // If plain fetch failed (403/throttled), download in chunks
+    console.log(`[download] direct fetch got ${directResponse.status}, trying chunked download`);
+    const totalSize = innertubeResult.contentLength;
+    if (totalSize > 0) {
+      const chunkSize = 1024 * 1024; // 1MB chunks
+      const chunks: Uint8Array[] = [];
+      let downloaded = 0;
 
-    if ((rangeResponse.ok || rangeResponse.status === 206) && rangeResponse.body) {
-      return new NextResponse(rangeResponse.body, {
-        status: 200,
-        headers: {
-          "Content-Type": contentType,
-          "Content-Disposition": `attachment; filename="${title}.${ext}"`,
-          ...(innertubeResult.contentLength
-            ? { "Content-Length": String(innertubeResult.contentLength) }
-            : {}),
-        },
-      });
+      while (downloaded < totalSize) {
+        const end = Math.min(downloaded + chunkSize - 1, totalSize - 1);
+        const chunkRes = await fetch(innertubeResult.streamUrl, {
+          headers: { ...streamHeaders, Range: `bytes=${downloaded}-${end}` },
+        });
+        if (!chunkRes.ok && chunkRes.status !== 206) {
+          console.error(`[download] chunk fetch failed: ${chunkRes.status}`);
+          break;
+        }
+        const buf = new Uint8Array(await chunkRes.arrayBuffer());
+        chunks.push(buf);
+        downloaded += buf.length;
+      }
+
+      if (downloaded >= totalSize) {
+        const fullBuffer = new Uint8Array(downloaded);
+        let offset = 0;
+        for (const chunk of chunks) {
+          fullBuffer.set(chunk, offset);
+          offset += chunk.length;
+        }
+        return new NextResponse(fullBuffer, {
+          status: 200,
+          headers: {
+            "Content-Type": contentType,
+            "Content-Disposition": `attachment; filename="${title}.${ext}"`,
+            "Content-Length": String(downloaded),
+          },
+        });
+      }
     }
 
     return NextResponse.json(
