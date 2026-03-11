@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Image from "next/image";
 import { Song } from "@/app/types/song";
 import { usePlayer } from "./PlayerProvider";
@@ -12,12 +13,15 @@ interface SongCardProps {
 export default function SongCard({ song, queue }: SongCardProps) {
   const { playSong, currentSong, isPlaying } = usePlayer();
   const isActive = currentSong?.videoId === song.videoId;
+  const [downloading, setDownloading] = useState(false);
 
   const handlePlay = () => {
     playSong(song, queue);
   };
 
   const handleDownload = async () => {
+    if (downloading) return;
+    setDownloading(true);
     try {
       const res = await fetch(`/api/download?videoId=${song.videoId}`);
       if (!res.ok) {
@@ -25,17 +29,25 @@ export default function SongCard({ song, queue }: SongCardProps) {
         alert(data.error || "Download failed");
         return;
       }
+      const disposition = res.headers.get("Content-Disposition");
+      const filenameMatch = disposition?.match(/filename="(.+)"/);
+      const filename =
+        filenameMatch?.[1] ??
+        `${song.title.replace(/[^a-zA-Z0-9 ]/g, "")}.m4a`;
+
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${song.title.replace(/[^a-zA-Z0-9 ]/g, "")}.mp3`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
     } catch {
-      alert("Download failed. Make sure yt-dlp is installed on the server.");
+      alert("Download failed.");
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -81,23 +93,28 @@ export default function SongCard({ song, queue }: SongCardProps) {
           </svg>
         </button>
         <button
-          className="song-card__btn song-card__btn--download"
+          className={`song-card__btn song-card__btn--download ${downloading ? "song-card__btn--downloading" : ""}`}
           onClick={handleDownload}
           aria-label="Download"
-          title="Download"
+          title={downloading ? "Downloading..." : "Download"}
+          disabled={downloading}
         >
-          <svg
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-          >
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-            <polyline points="7 10 12 15 17 10" />
-            <line x1="12" y1="15" x2="12" y2="3" />
-          </svg>
+          {downloading ? (
+            <span className="download-spinner" />
+          ) : (
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          )}
         </button>
       </div>
     </div>
