@@ -103,7 +103,7 @@ async function ensureYtDlp(): Promise<string | null> {
 function downloadWithYtDlp(
   videoId: string,
   ytDlpPath: string
-): Promise<{ buffer: Buffer; title: string; ext: string } | null> {
+): Promise<{ buffer: Buffer; title: string; ext: string; error?: string } | null> {
   return new Promise((resolve) => {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
 
@@ -113,13 +113,15 @@ function downloadWithYtDlp(
       .then((r) => r.stdout.trim())
       .catch(() => videoId);
 
-    const child = spawn(ytDlpPath, ["-f", "bestaudio", "-o", "-", url]);
+    const child = spawn(ytDlpPath, ["-f", "bestaudio", "-o", "-", "--no-cache-dir", url]);
 
     const chunks: Buffer[] = [];
+    const stderrLines: string[] = [];
     let detectedExt = "m4a";
     child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
     child.stderr.on("data", (data: Buffer) => {
       const msg = data.toString();
+      stderrLines.push(msg.trim());
       const fmtMatch = msg.match(/Downloading 1 format\(s\): (\d+)/);
       if (fmtMatch) {
         const itag = parseInt(fmtMatch[1]);
@@ -129,16 +131,24 @@ function downloadWithYtDlp(
     });
 
     child.on("close", async (code) => {
+      const stderrSummary = stderrLines.join(' | ').substring(0, 500);
+      console.log(`[yt-dlp] exit code=${code}, chunks=${chunks.length}, totalBytes=${chunks.reduce((s,c)=>s+c.length,0)}, stderr=${stderrSummary}`);
       if (code === 0 && chunks.length > 0) {
         const title = await titlePromise;
         resolve({ buffer: Buffer.concat(chunks), title, ext: detectedExt });
       } else {
-        resolve(null);
+        resolve({ buffer: Buffer.alloc(0), title: "", ext: "m4a", error: `code=${code} stderr=${stderrSummary}` });
       }
     });
 
-    child.on("error", () => resolve(null));
-    setTimeout(() => child.kill("SIGTERM"), 50000);
+    child.on("error", (err) => {
+      console.error(`[yt-dlp] spawn error:`, err);
+      resolve(null);
+    });
+    setTimeout(() => {
+      console.log(`[yt-dlp] timeout hit, killing process`);
+      child.kill("SIGTERM");
+    }, 50000);
   });
 }
 
@@ -280,8 +290,8 @@ export async function GET(request: NextRequest) {
       // yt-dlp available immediately — use it (handles all videos)
       console.log(`[download] using yt-dlp at ${quickYtDlp}`);
       const result = await downloadWithYtDlp(videoId, quickYtDlp);
-      diagnostics.push(`ytdlp-result: ${result ? `${result.buffer.length}B` : "null"}`);
-      if (result) {
+      diagnostics.push(`ytdlp-result: ${result?.error ?? (result?.buffer.length ? `${result.buffer.length}B` : "null")}`);
+      if (result && !result.error) {
         const title = result.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
         return new NextResponse(new Uint8Array(result.buffer), {
           status: 200,
@@ -310,8 +320,8 @@ export async function GET(request: NextRequest) {
     if (ytDlpPath) {
       console.log(`[download] using yt-dlp at ${ytDlpPath} (downloaded)`);
       const result = await downloadWithYtDlp(videoId, ytDlpPath);
-      diagnostics.push(`ytdlp-dl-result: ${result ? `${result.buffer.length}B` : "null"}`);
-      if (result) {
+      diagnostics.push(`ytdlp-dl-result: ${result?.error ?? (result?.buffer.length ? `${result.buffer.length}B` : "null")}`);
+      if (result && !result.error) {
         const title = result.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
         return new NextResponse(new Uint8Array(result.buffer), {
           status: 200,
