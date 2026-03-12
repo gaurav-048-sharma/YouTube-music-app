@@ -11,9 +11,7 @@ export const maxDuration = 60;
 const YT_DLP_TMP = "/tmp/yt-dlp";
 const YT_DLP_BUNDLED = process.cwd() + "/bin/yt-dlp";
 const YT_DLP_URLS = [
-  // Python zipapp (~3.5MB, needs python3 on system)
-  "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
-  // Standalone Linux binary (~22MB, no dependencies)
+  // Standalone Linux binary (~22MB, no Python needed — works on Vercel)
   "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
 ];
 
@@ -26,14 +24,17 @@ async function findYtDlp(): Promise<string | null> {
   if (process.env.YT_DLP_PATH) {
     try {
       await execFileAsync(process.env.YT_DLP_PATH, ["--version"], { timeout: 5000 });
+      console.log(`[yt-dlp] found via env: ${process.env.YT_DLP_PATH}`);
       return process.env.YT_DLP_PATH;
     } catch { /* not available */ }
   }
   // 2. Bundled binary (Vercel build-time install)
+  console.log(`[yt-dlp] checking bundled at ${YT_DLP_BUNDLED}, exists=${existsSync(YT_DLP_BUNDLED)}`);
   if (existsSync(YT_DLP_BUNDLED)) {
     try {
       chmodSync(YT_DLP_BUNDLED, 0o755);
-      await execFileAsync(YT_DLP_BUNDLED, ["--version"], { timeout: 10000 });
+      const { stdout } = await execFileAsync(YT_DLP_BUNDLED, ["--version"], { timeout: 10000 });
+      console.log(`[yt-dlp] bundled binary works, version: ${stdout.trim()}`);
       return YT_DLP_BUNDLED;
     } catch (e) {
       console.error(`[yt-dlp] bundled binary failed:`, e);
@@ -43,6 +44,7 @@ async function findYtDlp(): Promise<string | null> {
   if (existsSync(YT_DLP_TMP)) {
     try {
       await execFileAsync(YT_DLP_TMP, ["--version"], { timeout: 10000 });
+      console.log(`[yt-dlp] found at ${YT_DLP_TMP}`);
       return YT_DLP_TMP;
     } catch { /* corrupt or wrong platform */ }
   }
@@ -51,6 +53,7 @@ async function findYtDlp(): Promise<string | null> {
     await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 });
     return "yt-dlp";
   } catch { /* not on PATH */ }
+  console.log("[yt-dlp] not found anywhere");
   return null;
 }
 
