@@ -90,5 +90,64 @@ export async function GET(request: Request) {
     }
   }
 
+  // If ANDROID_VR worked, try to actually download audio
+  const vr = results["ANDROID_VR"] as { status?: string; audioFormats?: number; firstUrl?: string };
+  if (vr?.status === "OK" && (vr?.audioFormats ?? 0) > 0) {
+    try {
+      const body = {
+        videoId,
+        context: {
+          client: {
+            clientName: "ANDROID_VR",
+            clientVersion: "1.60.19",
+            hl: "en",
+            gl: "US",
+          },
+        },
+        contentCheckOk: true,
+        racyCheckOk: true,
+      };
+      const res = await fetch(
+        "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent":
+              "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+          },
+          body: JSON.stringify(body),
+        }
+      );
+      const data = await res.json();
+      const audioFmts = (data.streamingData?.adaptiveFormats ?? []).filter(
+        (f: { mimeType?: string; url?: string }) =>
+          f.mimeType?.startsWith("audio/") && f.url
+      );
+      if (audioFmts.length > 0) {
+        const fmt = audioFmts[0];
+        // Try to fetch first 100KB of audio
+        const audioRes = await fetch(fmt.url, {
+          headers: {
+            "User-Agent":
+              "com.google.android.apps.youtube.vr.oculus/1.60.19 gzip",
+            Range: "bytes=0-102400",
+          },
+        });
+        const buf = await audioRes.arrayBuffer();
+        results["DOWNLOAD_TEST"] = {
+          httpStatus: audioRes.status,
+          bytesReceived: buf.byteLength,
+          contentType: audioRes.headers.get("content-type"),
+          success: buf.byteLength > 1000,
+        };
+      }
+    } catch (e) {
+      results["DOWNLOAD_TEST"] = {
+        error: e instanceof Error ? e.message.substring(0, 100) : "unknown",
+      };
+    }
+  }
+
   return Response.json({ videoId, runtime: "edge", results });
 }
