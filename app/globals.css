@@ -290,6 +290,7 @@ body {
   display: flex;
   gap: 0.5rem;
   flex-shrink: 0;
+  position: relative;
 }
 
 .song-card__btn {
@@ -326,6 +327,22 @@ body {
   color: white !important;
   cursor: wait !important;
   pointer-events: none;
+}
+
+.song-card__btn--queued {
+  background: #b8860b !important;
+  color: white !important;
+  cursor: wait !important;
+  pointer-events: none;
+}
+
+.song-card__queue-status {
+  position: absolute;
+  bottom: -20px;
+  right: 0;
+  font-size: 0.65rem;
+  color: #b8860b;
+  white-space: nowrap;
 }
 
 .download-spinner {

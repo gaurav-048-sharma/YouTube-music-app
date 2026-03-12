@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import Image from "next/image";
 import { Song } from "@/app/types/song";
 import { usePlayer } from "./PlayerProvider";
@@ -14,25 +14,16 @@ export default function SongCard({ song, queue }: SongCardProps) {
   const { playSong, currentSong, isPlaying } = usePlayer();
   const isActive = currentSong?.videoId === song.videoId;
   const [downloading, setDownloading] = useState(false);
+  const [queued, setQueued] = useState(false);
+  const [queueMsg, setQueueMsg] = useState("");
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const handlePlay = () => {
     playSong(song, queue);
   };
 
-  const handleDownload = async () => {
-    if (downloading) return;
-    setDownloading(true);
-    try {
-      const res = await fetch(`/api/download?videoId=${song.videoId}`);
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        if (data.code === "NOT_CACHED") {
-          alert("This song hasn't been cached yet. Only pre-cached songs can be downloaded on the hosted version.");
-        } else {
-          alert(data.error || "Download failed");
-        }
-        return;
-      }
+  const downloadFile = useCallback(
+    async (res: Response) => {
       const disposition = res.headers.get("Content-Disposition");
       const filenameMatch = disposition?.match(/filename="(.+)"/);
       const filename =
@@ -48,6 +39,76 @@ export default function SongCard({ song, queue }: SongCardProps) {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+    },
+    [song.title]
+  );
+
+  const pollForReady = useCallback(() => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    let attempts = 0;
+    pollRef.current = setInterval(async () => {
+      attempts++;
+      if (attempts > 30) {
+        // Stop after ~5 minutes
+        if (pollRef.current) clearInterval(pollRef.current);
+        setQueued(false);
+        setQueueMsg("");
+        return;
+      }
+      try {
+        const res = await fetch(`/api/queue?videoId=${song.videoId}`);
+        const data = await res.json();
+        if (data.status === "cached") {
+          if (pollRef.current) clearInterval(pollRef.current);
+          setQueueMsg("Ready! Starting download...");
+          // Now download the cached file
+          const dlRes = await fetch(
+            `/api/download?videoId=${song.videoId}`
+          );
+          if (dlRes.ok) {
+            await downloadFile(dlRes);
+          }
+          setQueued(false);
+          setQueueMsg("");
+        } else if (data.status === "processing") {
+          setQueueMsg("Downloading... please wait");
+        } else if (data.status === "failed") {
+          if (pollRef.current) clearInterval(pollRef.current);
+          setQueueMsg("Download failed. Try again later.");
+          setTimeout(() => {
+            setQueued(false);
+            setQueueMsg("");
+          }, 3000);
+        }
+      } catch {
+        // ignore poll errors
+      }
+    }, 10000);
+  }, [song.videoId, downloadFile]);
+
+  const handleDownload = async () => {
+    if (downloading || queued) return;
+    setDownloading(true);
+    try {
+      const titleParam = encodeURIComponent(song.title);
+      const res = await fetch(
+        `/api/download?videoId=${song.videoId}&title=${titleParam}`
+      );
+
+      if (res.ok) {
+        await downloadFile(res);
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (data.code === "QUEUED" || data.code === "NOT_CACHED") {
+        // Song has been queued for download
+        setQueued(true);
+        setQueueMsg("Queued for download...");
+        pollForReady();
+      } else {
+        alert(data.error || "Download failed");
+      }
     } catch {
       alert("Download failed.");
     } finally {
@@ -97,13 +158,25 @@ export default function SongCard({ song, queue }: SongCardProps) {
           </svg>
         </button>
         <button
-          className={`song-card__btn song-card__btn--download ${downloading ? "song-card__btn--downloading" : ""}`}
+          className={`song-card__btn song-card__btn--download ${
+            downloading
+              ? "song-card__btn--downloading"
+              : queued
+                ? "song-card__btn--queued"
+                : ""
+          }`}
           onClick={handleDownload}
           aria-label="Download"
-          title={downloading ? "Downloading..." : "Download"}
-          disabled={downloading}
+          title={
+            queued
+              ? queueMsg
+              : downloading
+                ? "Downloading..."
+                : "Download"
+          }
+          disabled={downloading || queued}
         >
-          {downloading ? (
+          {downloading || queued ? (
             <span className="download-spinner" />
           ) : (
             <svg
@@ -120,6 +193,9 @@ export default function SongCard({ song, queue }: SongCardProps) {
             </svg>
           )}
         </button>
+        {queued && (
+          <span className="song-card__queue-status">{queueMsg}</span>
+        )}
       </div>
     </div>
   );

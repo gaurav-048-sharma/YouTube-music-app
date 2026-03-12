@@ -5,6 +5,7 @@ import { existsSync, writeFileSync, chmodSync } from "fs";
 import { Innertube } from "youtubei.js";
 import { connectDB } from "@/lib/mongodb";
 import { Song } from "@/lib/models/Song";
+import { DownloadQueue } from "@/lib/models/DownloadQueue";
 import { uploadAudio } from "@/lib/cloudinary";
 
 const execFileAsync = promisify(execFile);
@@ -504,12 +505,31 @@ export async function GET(request: NextRequest) {
     }
 
     if (!audioData) {
+      // Auto-queue for background caching
+      const songTitle = request.nextUrl.searchParams.get("title") || videoId;
+      try {
+        const existing = await DownloadQueue.findOne({ videoId }).lean();
+        if (!existing) {
+          await DownloadQueue.create({
+            videoId,
+            title: songTitle,
+            status: "pending",
+            requestedAt: new Date(),
+          });
+          console.log(`[download] queued ${videoId} for background caching`);
+        }
+      } catch {
+        // Queue insert may fail on duplicate — that's fine
+      }
+
+      const queueItem = await DownloadQueue.findOne({ videoId }).lean();
       return NextResponse.json(
         {
-          error: "This song hasn't been cached yet. It may need to be pre-cached before it can be downloaded.",
-          code: "NOT_CACHED",
+          error: "This song is being prepared for download. Please try again in a minute.",
+          code: "QUEUED",
+          status: queueItem?.status || "pending",
         },
-        { status: 404 }
+        { status: 202 }
       );
     }
 

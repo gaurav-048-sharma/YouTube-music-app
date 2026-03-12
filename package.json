@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "cache-worker": "node scripts/cache-worker.mjs",
+    "cache-seed": "node scripts/cache-seed.mjs"
   },
   "dependencies": {
     "bgutils-js": "^3.2.0",
