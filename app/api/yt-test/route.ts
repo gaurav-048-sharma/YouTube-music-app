@@ -1,4 +1,4 @@
-// Edge function to test if Vercel edge network can reach YouTube Innertube API
+// Edge function to test YouTube Innertube API with proper session
 export const runtime = "edge";
 
 export async function GET(request: Request) {
@@ -11,141 +11,111 @@ export async function GET(request: Request) {
 
   const results: Record<string, unknown> = {};
 
-  // Test IOS client (no signature decipher needed)
+  // Step 1: Get visitorData from YouTube's attestation endpoint
+  let visitorData = "";
+  try {
+    const attRes = await fetch(
+      "https://www.youtube.com/youtubei/v1/att/get?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: "WEB",
+              clientVersion: "2.20241126.01.00",
+            },
+          },
+        }),
+      }
+    );
+    const attData = await attRes.json();
+    visitorData = attData.responseContext?.visitorData || "";
+    results["visitorData"] = visitorData ? visitorData.substring(0, 30) + "..." : "none";
+  } catch (e) {
+    results["attestation"] = {
+      error: e instanceof Error ? e.message.substring(0, 80) : "unknown",
+    };
+  }
+
+  // Step 2: Test IOS and ANDROID_VR with visitorData
   const clients = [
     {
       name: "IOS",
       clientName: "IOS",
       clientVersion: "19.29.1",
       ua: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+      clientNumber: "5",
     },
     {
       name: "ANDROID_VR",
       clientName: "ANDROID_VR",
       clientVersion: "1.60.19",
       ua: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+      clientNumber: "28",
     },
     {
-      name: "TVHTML5",
-      clientName: "TVHTML5",
-      clientVersion: "7.20240813.07.00",
-      ua: "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 NativeBrowser/2.0 TV Safari/538.1",
-    },
-    {
-      name: "MEDIA_CONNECT",
-      clientName: "MEDIA_CONNECT_FRONTEND",
-      clientVersion: "0.1",
-      ua: "Mozilla/5.0",
+      name: "IOS_CREATOR",
+      clientName: "IOS_CREATOR",
+      clientVersion: "22.33.101",
+      ua: "com.google.ios.ytcreator/22.33.101 (iPhone16,2; U; CPU iOS 16_0 like Mac OS X)",
+      clientNumber: "15",
     },
   ];
 
   for (const client of clients) {
-    try {
-      const body = {
-        videoId,
-        context: {
-          client: {
-            clientName: client.clientName,
-            clientVersion: client.clientVersion,
-            hl: "en",
-            gl: "US",
+    for (const useVisitor of [false, true]) {
+      const key = `${client.name}${useVisitor ? "_WITH_VISITOR" : ""}`;
+      try {
+        const body: Record<string, unknown> = {
+          videoId,
+          context: {
+            client: {
+              clientName: client.clientName,
+              clientVersion: client.clientVersion,
+              hl: "en",
+              gl: "US",
+              ...(useVisitor && visitorData ? { visitorData } : {}),
+            },
           },
-        },
-        contentCheckOk: true,
-        racyCheckOk: true,
-      };
+          contentCheckOk: true,
+          racyCheckOk: true,
+        };
 
-      const res = await fetch(
-        "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": client.ua,
-          },
-          body: JSON.stringify(body),
-        }
-      );
-
-      const data = await res.json();
-      const audioFormats = (data.streamingData?.adaptiveFormats ?? [])
-        .filter(
-          (f: { mimeType?: string; url?: string }) =>
-            f.mimeType?.startsWith("audio/")
+        const res = await fetch(
+          "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": client.ua,
+              "X-Goog-Visitor-Id": useVisitor && visitorData ? visitorData : "",
+            },
+            body: JSON.stringify(body),
+          }
         );
-      const withUrl = audioFormats.filter(
-        (f: { url?: string }) => !!f.url
-      ).length;
 
-      results[client.name] = {
-        status: data.playabilityStatus?.status,
-        reason: data.playabilityStatus?.reason?.substring(0, 80),
-        audioFormats: audioFormats.length,
-        withUrl,
-      };
-    } catch (e) {
-      results[client.name] = {
-        error: e instanceof Error ? e.message.substring(0, 100) : "unknown",
-      };
-    }
-  }
+        const data = await res.json();
+        const audioFormats = (data.streamingData?.adaptiveFormats ?? []).filter(
+          (f: { mimeType?: string }) => f.mimeType?.startsWith("audio/")
+        );
+        const withUrl = audioFormats.filter((f: { url?: string }) => !!f.url).length;
 
-  // If ANDROID_VR worked, try to actually download audio
-  const vr = results["ANDROID_VR"] as { status?: string; audioFormats?: number; firstUrl?: string };
-  if (vr?.status === "OK" && (vr?.audioFormats ?? 0) > 0) {
-    try {
-      const body = {
-        videoId,
-        context: {
-          client: {
-            clientName: "ANDROID_VR",
-            clientVersion: "1.60.19",
-            hl: "en",
-            gl: "US",
-          },
-        },
-        contentCheckOk: true,
-        racyCheckOk: true,
-      };
-      const res = await fetch(
-        "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent":
-              "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-          },
-          body: JSON.stringify(body),
-        }
-      );
-      const data = await res.json();
-      const audioFmts = (data.streamingData?.adaptiveFormats ?? []).filter(
-        (f: { mimeType?: string; url?: string }) =>
-          f.mimeType?.startsWith("audio/") && f.url
-      );
-      if (audioFmts.length > 0) {
-        const fmt = audioFmts[0];
-        // Try to fetch first 100KB of audio
-        const audioRes = await fetch(fmt.url, {
-          headers: {
-            "User-Agent":
-              "com.google.android.apps.youtube.vr.oculus/1.60.19 gzip",
-            Range: "bytes=0-102400",
-          },
-        });
-        const buf = await audioRes.arrayBuffer();
-        results["DOWNLOAD_TEST"] = {
-          httpStatus: audioRes.status,
-          bytesReceived: buf.byteLength,
-          contentType: audioRes.headers.get("content-type"),
-          success: buf.byteLength > 1000,
+        results[key] = {
+          status: data.playabilityStatus?.status,
+          reason: data.playabilityStatus?.reason?.substring(0, 60),
+          audioFormats: audioFormats.length,
+          withUrl,
+        };
+      } catch (e) {
+        results[key] = {
+          error: e instanceof Error ? e.message.substring(0, 80) : "unknown",
         };
       }
-    } catch (e) {
-      results["DOWNLOAD_TEST"] = {
-        error: e instanceof Error ? e.message.substring(0, 100) : "unknown",
-      };
     }
   }
 
