@@ -270,13 +270,17 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    const diagnostics: string[] = [];
+
     // Check if yt-dlp is already available (local dev or warm Vercel function)
     const quickYtDlp = await findYtDlp();
+    diagnostics.push(`findYtDlp: ${quickYtDlp ?? "null"}`);
 
     if (quickYtDlp) {
       // yt-dlp available immediately — use it (handles all videos)
       console.log(`[download] using yt-dlp at ${quickYtDlp}`);
       const result = await downloadWithYtDlp(videoId, quickYtDlp);
+      diagnostics.push(`ytdlp-result: ${result ? `${result.buffer.length}B` : "null"}`);
       if (result) {
         const title = result.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
         return new NextResponse(new Uint8Array(result.buffer), {
@@ -292,17 +296,21 @@ export async function GET(request: NextRequest) {
 
     // Try IOS client (fast for non-throttled videos)
     const innertubeResult = await resolveWithInnertube(videoId);
+    diagnostics.push(`innertube: ${innertubeResult ? `${innertubeResult.clientUsed} cl=${innertubeResult.contentLength}` : "null"}`);
     if (innertubeResult) {
       const streamResponse = await tryStreamDownload(innertubeResult);
+      diagnostics.push(`stream: ${streamResponse ? streamResponse.status : "null"}`);
       if (streamResponse) return streamResponse;
       console.log("[download] IOS stream throttled/failed, falling back to yt-dlp");
     }
 
     // Last resort: download yt-dlp to /tmp and use it
     const ytDlpPath = await ensureYtDlp();
+    diagnostics.push(`ensureYtDlp: ${ytDlpPath ?? "null"}`);
     if (ytDlpPath) {
       console.log(`[download] using yt-dlp at ${ytDlpPath} (downloaded)`);
       const result = await downloadWithYtDlp(videoId, ytDlpPath);
+      diagnostics.push(`ytdlp-dl-result: ${result ? `${result.buffer.length}B` : "null"}`);
       if (result) {
         const title = result.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
         return new NextResponse(new Uint8Array(result.buffer), {
@@ -317,7 +325,7 @@ export async function GET(request: NextRequest) {
     }
 
     return NextResponse.json(
-      { error: "No downloadable audio format found for this video" },
+      { error: "No downloadable audio format found for this video", diagnostics },
       { status: 404 }
     );
   } catch (error) {
