@@ -107,13 +107,13 @@ function downloadWithYtDlp(
   return new Promise((resolve) => {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-    const titlePromise = execFileAsync(ytDlpPath, ["--get-title", url], {
+    const titlePromise = execFileAsync(ytDlpPath, ["--js-runtimes", "nodejs", "--get-title", url], {
       timeout: 15000,
     })
       .then((r) => r.stdout.trim())
       .catch(() => videoId);
 
-    const child = spawn(ytDlpPath, ["-f", "bestaudio", "-o", "-", "--no-cache-dir", url]);
+    const child = spawn(ytDlpPath, ["-f", "bestaudio", "-o", "-", "--no-cache-dir", "--js-runtimes", "nodejs", url]);
 
     const chunks: Buffer[] = [];
     const stderrLines: string[] = [];
