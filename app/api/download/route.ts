@@ -471,37 +471,24 @@ export async function GET(request: NextRequest) {
     // 2. Download audio from YouTube
     let audioData: { buffer: Buffer; title: string; ext: string } | null = null;
 
-    // Try yt-dlp first (handles all videos when not on datacenter IP)
-    const ytDlpPath = await findYtDlp();
-    if (ytDlpPath) {
-      console.log(`[download] trying yt-dlp at ${ytDlpPath}`);
-      audioData = await downloadWithYtDlp(videoId, ytDlpPath);
-    }
+    const isVercel = !!process.env.VERCEL;
 
-    // Fallback: Innertube IOS client (works for non-throttled videos)
-    if (!audioData) {
-      console.log(`[download] trying Innertube for ${videoId}`);
-      audioData = await downloadWithInnertube(videoId);
-    }
+    if (isVercel) {
+      // On Vercel, YouTube blocks ALL download methods from datacenter IPs.
+      // Skip everything and queue immediately — the local cache-worker will handle it.
+      console.log(`[download] on Vercel — skipping download attempts, queueing ${videoId}`);
+    } else {
+      // Local server — try yt-dlp (works from residential IPs)
+      const ytDlpPath = await findYtDlp();
+      if (ytDlpPath) {
+        console.log(`[download] trying yt-dlp at ${ytDlpPath}`);
+        audioData = await downloadWithYtDlp(videoId, ytDlpPath);
+      }
 
-    // Fallback: Cobalt API (works from datacenter IPs like Vercel)
-    if (!audioData) {
-      console.log(`[download] trying Cobalt API for ${videoId}`);
-      audioData = await downloadWithCobalt(videoId);
-    }
-
-    // Fallback: Direct YouTube Player API with embedded/TV clients
-    if (!audioData) {
-      console.log(`[download] trying Direct Player API for ${videoId}`);
-      audioData = await downloadWithDirectPlayerAPI(videoId);
-    }
-
-    // Last resort on Vercel: download yt-dlp binary to /tmp
-    if (!audioData && !ytDlpPath) {
-      const downloadedPath = await ensureYtDlp();
-      if (downloadedPath) {
-        console.log(`[download] trying downloaded yt-dlp at ${downloadedPath}`);
-        audioData = await downloadWithYtDlp(videoId, downloadedPath);
+      // Fallback: Innertube
+      if (!audioData) {
+        console.log(`[download] trying Innertube for ${videoId}`);
+        audioData = await downloadWithInnertube(videoId);
       }
     }
 
