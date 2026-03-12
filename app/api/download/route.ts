@@ -194,6 +194,84 @@ async function downloadWithInnertube(
   return null;
 }
 
+// ─── Cobalt API helper (works from datacenter IPs) ────────────────
+
+const COBALT_INSTANCES = [
+  "https://api.cobalt.tools",
+];
+
+async function downloadWithCobalt(
+  videoId: string
+): Promise<{ buffer: Buffer; title: string; ext: string } | null> {
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+  for (const instance of COBALT_INSTANCES) {
+    try {
+      console.log(`[cobalt] trying ${instance} for ${videoId}`);
+      const res = await fetch(`${instance}/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          url: ytUrl,
+          downloadMode: "audio",
+          audioFormat: "mp3",
+        }),
+      });
+
+      if (!res.ok) {
+        console.log(`[cobalt] ${instance} returned ${res.status}`);
+        continue;
+      }
+
+      const data = await res.json();
+      console.log(`[cobalt] response status: ${data.status}`);
+
+      if (data.status === "tunnel" || data.status === "redirect") {
+        const audioRes = await fetch(data.url);
+        if (!audioRes.ok) {
+          console.log(`[cobalt] audio fetch failed: ${audioRes.status}`);
+          continue;
+        }
+        const buf = Buffer.from(await audioRes.arrayBuffer());
+        if (buf.length < 50000) {
+          console.log(`[cobalt] audio too small: ${buf.length} bytes`);
+          continue;
+        }
+        // Try to get title from filename header or use videoId
+        const cd = audioRes.headers.get("content-disposition");
+        const fnMatch = cd?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+        const title = fnMatch
+          ? decodeURIComponent(fnMatch[1]).replace(/\.\w+$/, "")
+          : videoId;
+        return { buffer: buf, title, ext: "mp3" };
+      }
+
+      if (data.status === "picker" && Array.isArray(data.picker)) {
+        // Some responses return a picker with audio option
+        const audioOption = data.picker.find(
+          (p: { type?: string }) => p.type === "audio"
+        );
+        if (audioOption?.url) {
+          const audioRes = await fetch(audioOption.url);
+          if (audioRes.ok) {
+            const buf = Buffer.from(await audioRes.arrayBuffer());
+            if (buf.length > 50000) {
+              return { buffer: buf, title: videoId, ext: "mp3" };
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.log(`[cobalt] ${instance} error:`, err instanceof Error ? err.message : err);
+      continue;
+    }
+  }
+  return null;
+}
+
 // ─── Main GET handler ─────────────────────────────────────────────
 
 export async function GET(request: NextRequest) {
@@ -246,6 +324,12 @@ export async function GET(request: NextRequest) {
     if (!audioData) {
       console.log(`[download] trying Innertube for ${videoId}`);
       audioData = await downloadWithInnertube(videoId);
+    }
+
+    // Fallback: Cobalt API (works from datacenter IPs like Vercel)
+    if (!audioData) {
+      console.log(`[download] trying Cobalt API for ${videoId}`);
+      audioData = await downloadWithCobalt(videoId);
     }
 
     // Last resort on Vercel: download yt-dlp binary to /tmp
