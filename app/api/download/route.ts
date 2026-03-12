@@ -130,66 +130,222 @@ const CLIENT_USER_AGENTS: Record<string, string> = {
 async function downloadWithInnertube(
   videoId: string
 ): Promise<{ buffer: Buffer; title: string; ext: string } | null> {
-  try {
-    const yt = await Innertube.create({
-      retrieve_player: false,
-      generate_session_locally: true,
-    });
+  // Try multiple Innertube configurations
+  const configs = [
+    { retrievePlayer: false, clients: ["IOS", "ANDROID"] as const },
+    { retrievePlayer: true, clients: ["WEB"] as const },
+  ];
 
-    for (const client of ["IOS", "ANDROID"] as const) {
-      try {
-        const info = await yt.getBasicInfo(videoId, { client });
-        const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
-          .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
-          .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+  for (const config of configs) {
+    try {
+      const yt = await Innertube.create({
+        retrieve_player: config.retrievePlayer,
+        generate_session_locally: true,
+      });
 
-        if (audioFormats.length === 0) continue;
+      for (const client of config.clients) {
+        try {
+          console.log(`[innertube] trying ${client} (player=${config.retrievePlayer})`);
+          const info = await yt.getBasicInfo(videoId, { client });
+          const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
+            .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
+            .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
 
-        const fmt = audioFormats[0];
-        const title = info.basic_info.title ?? videoId;
-        const isM4A = fmt.mime_type?.includes("mp4");
-        const ext = isM4A ? "m4a" : "webm";
-        const ua = CLIENT_USER_AGENTS[client] || CLIENT_USER_AGENTS.WEB;
-        const contentLength = fmt.content_length ?? 0;
-
-        // Try direct fetch
-        const directRes = await fetch(fmt.url!, {
-          headers: { "User-Agent": ua },
-        });
-        if (directRes.ok) {
-          const buf = Buffer.from(await directRes.arrayBuffer());
-          if (buf.length > 100000) {
-            return { buffer: buf, title, ext };
+          if (audioFormats.length === 0) {
+            console.log(`[innertube] ${client}: no audio formats`);
+            continue;
           }
-        }
 
-        // Try chunked download
-        if (contentLength > 0) {
+          const fmt = audioFormats[0];
+          const title = info.basic_info.title ?? videoId;
+          const isM4A = fmt.mime_type?.includes("mp4");
+          const ext = isM4A ? "m4a" : "webm";
+          const ua = CLIENT_USER_AGENTS[client] || CLIENT_USER_AGENTS.WEB;
+          const contentLength = fmt.content_length ?? 0;
+
+          // Try direct fetch
+          const directRes = await fetch(fmt.url!, {
+            headers: { "User-Agent": ua },
+          });
+          if (directRes.ok) {
+            const buf = Buffer.from(await directRes.arrayBuffer());
+            if (buf.length > 100000) {
+              return { buffer: buf, title, ext };
+            }
+          }
+
+          // Try chunked download
+          if (contentLength > 0) {
+            const chunkSize = 1024 * 1024;
+            const chunks: Buffer[] = [];
+            let downloaded = 0;
+
+            while (downloaded < contentLength) {
+              const end = Math.min(downloaded + chunkSize - 1, contentLength - 1);
+              const res = await fetch(fmt.url!, {
+                headers: { "User-Agent": ua, Range: `bytes=${downloaded}-${end}` },
+              });
+              if (!res.ok && res.status !== 206) break;
+              const buf = Buffer.from(await res.arrayBuffer());
+              chunks.push(buf);
+              downloaded += buf.length;
+            }
+
+            if (downloaded >= contentLength) {
+              return { buffer: Buffer.concat(chunks), title, ext };
+            }
+          }
+        } catch (err) {
+          console.log(`[innertube] ${client} failed:`, err instanceof Error ? err.message : err);
+          continue;
+        }
+      }
+    } catch (err) {
+      console.log(`[innertube] config failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+  return null;
+}
+
+// ─── Direct YouTube Player API (embedded clients for datacenter IPs) ──
+
+async function downloadWithDirectPlayerAPI(
+  videoId: string
+): Promise<{ buffer: Buffer; title: string; ext: string } | null> {
+  // These embedded/TV clients are less likely to be blocked on datacenter IPs
+  const clients = [
+    {
+      clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+      clientVersion: "2.0",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 NativeBrowser/2.0 TV Safari/538.1",
+      thirdParty: { embedUrl: "https://www.youtube.com" },
+    },
+    {
+      clientName: "ANDROID_MUSIC",
+      clientVersion: "7.27.52",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 14) gzip",
+    },
+    {
+      clientName: "ANDROID_VR",
+      clientVersion: "1.60.19",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+    },
+    {
+      clientName: "ANDROID_TESTSUITE",
+      clientVersion: "1.9",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: "com.google.android.youtube/19.29.34 (Linux; U; Android 14) gzip",
+    },
+  ];
+
+  for (const client of clients) {
+    try {
+      console.log(`[player-api] trying ${client.clientName}`);
+      const body: Record<string, unknown> = {
+        videoId,
+        context: {
+          client: {
+            clientName: client.clientName,
+            clientVersion: client.clientVersion,
+            hl: "en",
+            gl: "US",
+          },
+        },
+        contentCheckOk: true,
+        racyCheckOk: true,
+      };
+
+      if ("thirdParty" in client) {
+        (body.context as Record<string, unknown>).thirdParty = client.thirdParty;
+      }
+
+      const res = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${client.apiKey}&prettyPrint=false`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": client.ua,
+            "X-YouTube-Client-Name": "85",
+            "X-YouTube-Client-Version": client.clientVersion,
+          },
+          body: JSON.stringify(body),
+        }
+      );
+
+      if (!res.ok) {
+        console.log(`[player-api] ${client.clientName}: HTTP ${res.status}`);
+        continue;
+      }
+
+      const data = await res.json();
+      const title = data.videoDetails?.title ?? videoId;
+
+      if (data.playabilityStatus?.status !== "OK") {
+        console.log(`[player-api] ${client.clientName}: ${data.playabilityStatus?.status} - ${data.playabilityStatus?.reason || "unknown"}`);
+        continue;
+      }
+
+      const formats = [
+        ...(data.streamingData?.adaptiveFormats ?? []),
+        ...(data.streamingData?.formats ?? []),
+      ];
+
+      const audioFormats = formats
+        .filter((f: { mimeType?: string; url?: string }) => f.mimeType?.startsWith("audio/") && f.url)
+        .sort((a: { bitrate?: number }, b: { bitrate?: number }) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+
+      if (audioFormats.length === 0) {
+        console.log(`[player-api] ${client.clientName}: no audio formats (${formats.length} total formats)`);
+        continue;
+      }
+
+      console.log(`[player-api] ${client.clientName}: found ${audioFormats.length} audio formats`);
+      const fmt = audioFormats[0];
+      const ext = fmt.mimeType?.includes("mp4") ? "m4a" : "webm";
+
+      // Download the audio
+      const audioRes = await fetch(fmt.url, {
+        headers: { "User-Agent": client.ua },
+      });
+
+      if (!audioRes.ok) {
+        console.log(`[player-api] ${client.clientName}: audio download HTTP ${audioRes.status}`);
+        // Try chunked if content-length known
+        const cl = fmt.contentLength ? parseInt(fmt.contentLength) : 0;
+        if (cl > 0) {
           const chunkSize = 1024 * 1024;
           const chunks: Buffer[] = [];
           let downloaded = 0;
-
-          while (downloaded < contentLength) {
-            const end = Math.min(downloaded + chunkSize - 1, contentLength - 1);
-            const res = await fetch(fmt.url!, {
-              headers: { "User-Agent": ua, Range: `bytes=${downloaded}-${end}` },
+          while (downloaded < cl) {
+            const end = Math.min(downloaded + chunkSize - 1, cl - 1);
+            const chunkRes = await fetch(fmt.url, {
+              headers: { "User-Agent": client.ua, Range: `bytes=${downloaded}-${end}` },
             });
-            if (!res.ok && res.status !== 206) break;
-            const buf = Buffer.from(await res.arrayBuffer());
+            if (!chunkRes.ok && chunkRes.status !== 206) break;
+            const buf = Buffer.from(await chunkRes.arrayBuffer());
             chunks.push(buf);
             downloaded += buf.length;
           }
-
-          if (downloaded >= contentLength) {
+          if (downloaded >= cl) {
             return { buffer: Buffer.concat(chunks), title, ext };
           }
         }
-      } catch {
         continue;
       }
+
+      const buf = Buffer.from(await audioRes.arrayBuffer());
+      if (buf.length > 100000) {
+        return { buffer: buf, title, ext };
+      }
+      console.log(`[player-api] ${client.clientName}: audio too small (${buf.length} bytes)`);
+    } catch (err) {
+      console.log(`[player-api] ${client.clientName} error:`, err instanceof Error ? err.message : err);
+      continue;
     }
-  } catch {
-    /* innertube failed entirely */
   }
   return null;
 }
@@ -330,6 +486,12 @@ export async function GET(request: NextRequest) {
     if (!audioData) {
       console.log(`[download] trying Cobalt API for ${videoId}`);
       audioData = await downloadWithCobalt(videoId);
+    }
+
+    // Fallback: Direct YouTube Player API with embedded/TV clients
+    if (!audioData) {
+      console.log(`[download] trying Direct Player API for ${videoId}`);
+      audioData = await downloadWithDirectPlayerAPI(videoId);
     }
 
     // Last resort on Vercel: download yt-dlp binary to /tmp
