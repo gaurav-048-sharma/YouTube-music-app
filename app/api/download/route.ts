@@ -3,178 +3,123 @@ import { spawn, execFile } from "child_process";
 import { promisify } from "util";
 import { existsSync, writeFileSync, chmodSync } from "fs";
 import { Innertube } from "youtubei.js";
+import { connectDB } from "@/lib/mongodb";
+import { Song } from "@/lib/models/Song";
+import { uploadAudio } from "@/lib/cloudinary";
 
 const execFileAsync = promisify(execFile);
 
 export const maxDuration = 60;
 
-const YT_COOKIES_PATH = "/tmp/yt-cookies.txt";
+// ─── yt-dlp helpers ───────────────────────────────────────────────
 
-/** Write YouTube cookies from env var to disk for yt-dlp. */
-function ensureCookiesFile(): string | null {
-  const b64 = process.env.YT_COOKIES_BASE64;
-  if (!b64) return null;
+const YT_DLP_TMP = "/tmp/yt-dlp";
+const YT_DLP_BUNDLED = process.cwd() + "/bin/yt-dlp";
+let ytDlpDownloadPromise: Promise<string | null> | null = null;
+
+async function findYtDlp(): Promise<string | null> {
+  if (process.env.YT_DLP_PATH) {
+    try {
+      await execFileAsync(process.env.YT_DLP_PATH, ["--version"], { timeout: 5000 });
+      return process.env.YT_DLP_PATH;
+    } catch { /* skip */ }
+  }
+  if (existsSync(YT_DLP_BUNDLED)) {
+    try {
+      chmodSync(YT_DLP_BUNDLED, 0o755);
+      await execFileAsync(YT_DLP_BUNDLED, ["--version"], { timeout: 10000 });
+      return YT_DLP_BUNDLED;
+    } catch { /* skip */ }
+  }
+  if (existsSync(YT_DLP_TMP)) {
+    try {
+      await execFileAsync(YT_DLP_TMP, ["--version"], { timeout: 10000 });
+      return YT_DLP_TMP;
+    } catch { /* skip */ }
+  }
   try {
-    const content = Buffer.from(b64, "base64").toString("utf-8");
-    writeFileSync(YT_COOKIES_PATH, content);
-    return YT_COOKIES_PATH;
+    await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 });
+    return "yt-dlp";
+  } catch { /* skip */ }
+  return null;
+}
+
+async function downloadYtDlpBinary(): Promise<string | null> {
+  const url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
+  try {
+    console.log("[yt-dlp] downloading standalone binary...");
+    const res = await fetch(url, { redirect: "follow" });
+    if (!res.ok) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    writeFileSync(YT_DLP_TMP, buf);
+    chmodSync(YT_DLP_TMP, 0o755);
+    await execFileAsync(YT_DLP_TMP, ["--version"], { timeout: 30000 });
+    return YT_DLP_TMP;
   } catch {
     return null;
   }
 }
 
-const YT_DLP_TMP = "/tmp/yt-dlp";
-const YT_DLP_BUNDLED = process.cwd() + "/bin/yt-dlp";
-const YT_DLP_URLS = [
-  // Standalone Linux binary (~22MB, no Python needed — works on Vercel)
-  "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
-];
-
-// Singleton promise to prevent concurrent downloads
-let ytDlpResolvePromise: Promise<string | null> | null = null;
-
-/** Find an already-available yt-dlp (no download). */
-async function findYtDlp(): Promise<string | null> {
-  // 1. Explicit env var (local dev)
-  if (process.env.YT_DLP_PATH) {
-    try {
-      await execFileAsync(process.env.YT_DLP_PATH, ["--version"], { timeout: 5000 });
-      console.log(`[yt-dlp] found via env: ${process.env.YT_DLP_PATH}`);
-      return process.env.YT_DLP_PATH;
-    } catch { /* not available */ }
-  }
-  // 2. Bundled binary (Vercel build-time install)
-  console.log(`[yt-dlp] checking bundled at ${YT_DLP_BUNDLED}, exists=${existsSync(YT_DLP_BUNDLED)}`);
-  if (existsSync(YT_DLP_BUNDLED)) {
-    try {
-      chmodSync(YT_DLP_BUNDLED, 0o755);
-      const { stdout } = await execFileAsync(YT_DLP_BUNDLED, ["--version"], { timeout: 10000 });
-      console.log(`[yt-dlp] bundled binary works, version: ${stdout.trim()}`);
-      return YT_DLP_BUNDLED;
-    } catch (e) {
-      console.error(`[yt-dlp] bundled binary failed:`, e);
-    }
-  }
-  // 3. Previously downloaded to /tmp
-  if (existsSync(YT_DLP_TMP)) {
-    try {
-      await execFileAsync(YT_DLP_TMP, ["--version"], { timeout: 10000 });
-      console.log(`[yt-dlp] found at ${YT_DLP_TMP}`);
-      return YT_DLP_TMP;
-    } catch { /* corrupt or wrong platform */ }
-  }
-  // 4. System PATH
-  try {
-    await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 });
-    return "yt-dlp";
-  } catch { /* not on PATH */ }
-  console.log("[yt-dlp] not found anywhere");
-  return null;
-}
-
-/** Download yt-dlp binary to /tmp for Vercel serverless. */
-async function downloadYtDlp(): Promise<string | null> {
-  for (const url of YT_DLP_URLS) {
-    try {
-      console.log(`[yt-dlp] downloading from ${url}...`);
-      const res = await fetch(url, { redirect: "follow" });
-      if (!res.ok) {
-        console.error(`[yt-dlp] HTTP ${res.status} from ${url}`);
-        continue;
-      }
-      const buf = Buffer.from(await res.arrayBuffer());
-      writeFileSync(YT_DLP_TMP, buf);
-      chmodSync(YT_DLP_TMP, 0o755);
-      console.log(`[yt-dlp] wrote ${(buf.length / 1024 / 1024).toFixed(1)}MB to ${YT_DLP_TMP}`);
-
-      const { stdout } = await execFileAsync(YT_DLP_TMP, ["--version"], { timeout: 30000 });
-      console.log(`[yt-dlp] version: ${stdout.trim()}`);
-      return YT_DLP_TMP;
-    } catch (err) {
-      console.error(`[yt-dlp] failed with ${url}:`, err);
-    }
-  }
-  return null;
-}
-
-/** Ensure yt-dlp is available, downloading if necessary. Singleton. */
 async function ensureYtDlp(): Promise<string | null> {
   const existing = await findYtDlp();
   if (existing) return existing;
-
-  // Deduplicate concurrent download attempts
-  if (!ytDlpResolvePromise) {
-    ytDlpResolvePromise = downloadYtDlp().finally(() => {
-      ytDlpResolvePromise = null;
+  if (!ytDlpDownloadPromise) {
+    ytDlpDownloadPromise = downloadYtDlpBinary().finally(() => {
+      ytDlpDownloadPromise = null;
     });
   }
-  return ytDlpResolvePromise;
+  return ytDlpDownloadPromise;
 }
 
-/**
- * Download audio via yt-dlp to a buffer.
- * yt-dlp handles signature decipher + N-token → no throttle.
- */
 function downloadWithYtDlp(
   videoId: string,
   ytDlpPath: string
-): Promise<{ buffer: Buffer; title: string; ext: string; error?: string } | null> {
+): Promise<{ buffer: Buffer; title: string; ext: string } | null> {
   return new Promise((resolve) => {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const cookiesFile = ensureCookiesFile();
-
-    const baseArgs = [
-      "--js-runtimes", "node",
+    const args = [
+      "-f", "bestaudio",
+      "-o", "-",
       "--no-cache-dir",
-      "--geo-bypass",
-      "--extractor-args", "youtube:player_client=mediaconnect",
+      "--js-runtimes", "node",
     ];
-    if (cookiesFile) baseArgs.push("--cookies", cookiesFile);
 
-    const titlePromise = execFileAsync(ytDlpPath, [...baseArgs, "--get-title", url], {
-      timeout: 15000,
-    })
+    const titlePromise = execFileAsync(ytDlpPath, [
+      "--js-runtimes", "node", "--no-cache-dir", "--get-title", url,
+    ], { timeout: 15000 })
       .then((r) => r.stdout.trim())
       .catch(() => videoId);
 
-    const child = spawn(ytDlpPath, ["-f", "bestaudio", "-o", "-", ...baseArgs, url]);
+    const child = spawn(ytDlpPath, [...args, url]);
 
     const chunks: Buffer[] = [];
-    const stderrLines: string[] = [];
     let detectedExt = "m4a";
+
     child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
     child.stderr.on("data", (data: Buffer) => {
       const msg = data.toString();
-      stderrLines.push(msg.trim());
       const fmtMatch = msg.match(/Downloading 1 format\(s\): (\d+)/);
       if (fmtMatch) {
         const itag = parseInt(fmtMatch[1]);
         detectedExt = [249, 250, 251].includes(itag) ? "webm" : "m4a";
       }
-      if (msg.includes("ERROR")) console.error(`[yt-dlp] ${msg.trim()}`);
     });
 
     child.on("close", async (code) => {
-      const stderrSummary = stderrLines.join(' | ').substring(0, 500);
-      console.log(`[yt-dlp] exit code=${code}, chunks=${chunks.length}, totalBytes=${chunks.reduce((s,c)=>s+c.length,0)}, stderr=${stderrSummary}`);
       if (code === 0 && chunks.length > 0) {
         const title = await titlePromise;
         resolve({ buffer: Buffer.concat(chunks), title, ext: detectedExt });
       } else {
-        resolve({ buffer: Buffer.alloc(0), title: "", ext: "m4a", error: `code=${code} stderr=${stderrSummary}` });
+        resolve(null);
       }
     });
 
-    child.on("error", (err) => {
-      console.error(`[yt-dlp] spawn error:`, err);
-      resolve(null);
-    });
-    setTimeout(() => {
-      console.log(`[yt-dlp] timeout hit, killing process`);
-      child.kill("SIGTERM");
-    }, 50000);
+    child.on("error", () => resolve(null));
+    setTimeout(() => child.kill("SIGTERM"), 50000);
   });
 }
+
+// ─── Innertube helpers ────────────────────────────────────────────
 
 const CLIENT_USER_AGENTS: Record<string, string> = {
   IOS: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
@@ -182,116 +127,74 @@ const CLIENT_USER_AGENTS: Record<string, string> = {
   WEB: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 };
 
-/**
- * Try youtubei.js IOS client to get a pre-signed audio URL.
- * Works for non-throttled videos without needing player JS.
- */
-async function resolveWithInnertube(videoId: string): Promise<{
-  streamUrl: string;
-  title: string;
-  contentLength: number;
-  mimeType: string;
-  clientUsed: string;
-} | null> {
-  const yt = await Innertube.create({
-    retrieve_player: false,
-    generate_session_locally: true,
-  });
-
-  for (const client of ["IOS", "ANDROID"] as const) {
-    try {
-      console.log(`[innertube] trying ${client} for ${videoId}`);
-      const info = await yt.getBasicInfo(videoId, { client });
-
-      const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
-        .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
-        .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
-
-      if (audioFormats.length === 0) continue;
-
-      const fmt = audioFormats[0];
-      console.log(`[innertube] ${client}: itag=${fmt.itag} bitrate=${fmt.bitrate}`);
-      return {
-        streamUrl: fmt.url!,
-        title: info.basic_info.title ?? videoId,
-        contentLength: fmt.content_length ?? 0,
-        mimeType: fmt.mime_type ?? "audio/mp4",
-        clientUsed: client,
-      };
-    } catch (err) {
-      console.error(`[innertube] ${client} failed:`, err);
-    }
-  }
-  return null;
-}
-
-/** Try to stream audio from an Innertube URL. Returns Response or null. */
-async function tryStreamDownload(info: {
-  streamUrl: string;
-  title: string;
-  contentLength: number;
-  mimeType: string;
-  clientUsed: string;
-}): Promise<NextResponse | null> {
-  const title = info.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || "audio";
-  const isM4A = info.mimeType.includes("mp4");
-  const ext = isM4A ? "m4a" : "webm";
-  const contentType = isM4A ? "audio/mp4" : "audio/webm";
-  const ua = CLIENT_USER_AGENTS[info.clientUsed] || CLIENT_USER_AGENTS.WEB;
-
-  // Try direct fetch
-  const directRes = await fetch(info.streamUrl, {
-    headers: { "User-Agent": ua },
-  });
-  if (directRes.ok && directRes.body) {
-    return new NextResponse(directRes.body, {
-      status: 200,
-      headers: {
-        "Content-Type": contentType,
-        "Content-Disposition": `attachment; filename="${title}.${ext}"`,
-        ...(info.contentLength ? { "Content-Length": String(info.contentLength) } : {}),
-      },
+async function downloadWithInnertube(
+  videoId: string
+): Promise<{ buffer: Buffer; title: string; ext: string } | null> {
+  try {
+    const yt = await Innertube.create({
+      retrieve_player: false,
+      generate_session_locally: true,
     });
-  }
 
-  // Try chunked download (handles 403 on direct but 206 on Range)
-  console.log(`[download] direct fetch ${directRes.status}, trying chunked`);
-  if (info.contentLength > 0) {
-    const chunkSize = 1024 * 1024;
-    const chunks: Uint8Array[] = [];
-    let downloaded = 0;
+    for (const client of ["IOS", "ANDROID"] as const) {
+      try {
+        const info = await yt.getBasicInfo(videoId, { client });
+        const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
+          .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
+          .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
 
-    while (downloaded < info.contentLength) {
-      const end = Math.min(downloaded + chunkSize - 1, info.contentLength - 1);
-      const res = await fetch(info.streamUrl, {
-        headers: { "User-Agent": ua, Range: `bytes=${downloaded}-${end}` },
-      });
-      if (!res.ok && res.status !== 206) {
-        console.error(`[download] chunk at ${downloaded} failed: ${res.status}`);
-        break;
+        if (audioFormats.length === 0) continue;
+
+        const fmt = audioFormats[0];
+        const title = info.basic_info.title ?? videoId;
+        const isM4A = fmt.mime_type?.includes("mp4");
+        const ext = isM4A ? "m4a" : "webm";
+        const ua = CLIENT_USER_AGENTS[client] || CLIENT_USER_AGENTS.WEB;
+        const contentLength = fmt.content_length ?? 0;
+
+        // Try direct fetch
+        const directRes = await fetch(fmt.url!, {
+          headers: { "User-Agent": ua },
+        });
+        if (directRes.ok) {
+          const buf = Buffer.from(await directRes.arrayBuffer());
+          if (buf.length > 100000) {
+            return { buffer: buf, title, ext };
+          }
+        }
+
+        // Try chunked download
+        if (contentLength > 0) {
+          const chunkSize = 1024 * 1024;
+          const chunks: Buffer[] = [];
+          let downloaded = 0;
+
+          while (downloaded < contentLength) {
+            const end = Math.min(downloaded + chunkSize - 1, contentLength - 1);
+            const res = await fetch(fmt.url!, {
+              headers: { "User-Agent": ua, Range: `bytes=${downloaded}-${end}` },
+            });
+            if (!res.ok && res.status !== 206) break;
+            const buf = Buffer.from(await res.arrayBuffer());
+            chunks.push(buf);
+            downloaded += buf.length;
+          }
+
+          if (downloaded >= contentLength) {
+            return { buffer: Buffer.concat(chunks), title, ext };
+          }
+        }
+      } catch {
+        continue;
       }
-      const buf = new Uint8Array(await res.arrayBuffer());
-      chunks.push(buf);
-      downloaded += buf.length;
     }
-
-    if (downloaded >= info.contentLength) {
-      const full = new Uint8Array(downloaded);
-      let off = 0;
-      for (const c of chunks) { full.set(c, off); off += c.length; }
-      return new NextResponse(full, {
-        status: 200,
-        headers: {
-          "Content-Type": contentType,
-          "Content-Disposition": `attachment; filename="${title}.${ext}"`,
-          "Content-Length": String(downloaded),
-        },
-      });
-    }
+  } catch {
+    /* innertube failed entirely */
   }
-
   return null;
 }
+
+// ─── Main GET handler ─────────────────────────────────────────────
 
 export async function GET(request: NextRequest) {
   const videoId = request.nextUrl.searchParams.get("videoId");
@@ -304,64 +207,101 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const diagnostics: string[] = [];
+    // 1. Check MongoDB cache — if found, redirect to Cloudinary
+    await connectDB();
+    const cached = await Song.findOne({ videoId }).lean();
 
-    // Check if yt-dlp is already available (local dev or warm Vercel function)
-    const quickYtDlp = await findYtDlp();
-    diagnostics.push(`findYtDlp: ${quickYtDlp ?? "null"}`);
+    if (cached) {
+      console.log(`[download] cache hit for ${videoId}, redirecting to Cloudinary`);
+      const title = cached.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
 
-    if (quickYtDlp) {
-      // yt-dlp available immediately — use it (handles all videos)
-      console.log(`[download] using yt-dlp at ${quickYtDlp}`);
-      const result = await downloadWithYtDlp(videoId, quickYtDlp);
-      diagnostics.push(`ytdlp-result: ${result?.error ?? (result?.buffer.length ? `${result.buffer.length}B` : "null")}`);
-      if (result && !result.error) {
-        const title = result.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
-        return new NextResponse(new Uint8Array(result.buffer), {
+      // Fetch from Cloudinary and serve with proper headers
+      const cloudRes = await fetch(cached.cloudinaryUrl);
+      if (cloudRes.ok && cloudRes.body) {
+        return new NextResponse(cloudRes.body, {
           status: 200,
           headers: {
-            "Content-Type": result.ext === "webm" ? "audio/webm" : "audio/mp4",
-            "Content-Disposition": `attachment; filename="${title}.${result.ext}"`,
-            "Content-Length": String(result.buffer.length),
+            "Content-Type": cached.ext === "webm" ? "audio/webm" : "audio/mp4",
+            "Content-Disposition": `attachment; filename="${title}.${cached.ext}"`,
+            ...(cached.fileSize ? { "Content-Length": String(cached.fileSize) } : {}),
           },
         });
       }
+      // Cloudinary URL expired/broken — delete stale record and re-download
+      console.log(`[download] Cloudinary URL broken for ${videoId}, re-downloading`);
+      await Song.deleteOne({ videoId });
     }
 
-    // Try IOS client (fast for non-throttled videos)
-    const innertubeResult = await resolveWithInnertube(videoId);
-    diagnostics.push(`innertube: ${innertubeResult ? `${innertubeResult.clientUsed} cl=${innertubeResult.contentLength}` : "null"}`);
-    if (innertubeResult) {
-      const streamResponse = await tryStreamDownload(innertubeResult);
-      diagnostics.push(`stream: ${streamResponse ? streamResponse.status : "null"}`);
-      if (streamResponse) return streamResponse;
-      console.log("[download] IOS stream throttled/failed, falling back to yt-dlp");
-    }
+    // 2. Download audio from YouTube
+    let audioData: { buffer: Buffer; title: string; ext: string } | null = null;
 
-    // Last resort: download yt-dlp to /tmp and use it
-    const ytDlpPath = await ensureYtDlp();
-    diagnostics.push(`ensureYtDlp: ${ytDlpPath ?? "null"}`);
+    // Try yt-dlp first (handles all videos when not on datacenter IP)
+    const ytDlpPath = await findYtDlp();
     if (ytDlpPath) {
-      console.log(`[download] using yt-dlp at ${ytDlpPath} (downloaded)`);
-      const result = await downloadWithYtDlp(videoId, ytDlpPath);
-      diagnostics.push(`ytdlp-dl-result: ${result?.error ?? (result?.buffer.length ? `${result.buffer.length}B` : "null")}`);
-      if (result && !result.error) {
-        const title = result.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
-        return new NextResponse(new Uint8Array(result.buffer), {
-          status: 200,
-          headers: {
-            "Content-Type": result.ext === "webm" ? "audio/webm" : "audio/mp4",
-            "Content-Disposition": `attachment; filename="${title}.${result.ext}"`,
-            "Content-Length": String(result.buffer.length),
-          },
-        });
+      console.log(`[download] trying yt-dlp at ${ytDlpPath}`);
+      audioData = await downloadWithYtDlp(videoId, ytDlpPath);
+    }
+
+    // Fallback: Innertube IOS client (works for non-throttled videos)
+    if (!audioData) {
+      console.log(`[download] trying Innertube for ${videoId}`);
+      audioData = await downloadWithInnertube(videoId);
+    }
+
+    // Last resort on Vercel: download yt-dlp binary to /tmp
+    if (!audioData && !ytDlpPath) {
+      const downloadedPath = await ensureYtDlp();
+      if (downloadedPath) {
+        console.log(`[download] trying downloaded yt-dlp at ${downloadedPath}`);
+        audioData = await downloadWithYtDlp(videoId, downloadedPath);
       }
     }
 
-    return NextResponse.json(
-      { error: "No downloadable audio format found for this video", diagnostics },
-      { status: 404 }
-    );
+    if (!audioData) {
+      return NextResponse.json(
+        { error: "Could not download audio for this video. Try a different song." },
+        { status: 404 }
+      );
+    }
+
+    // 3. Upload to Cloudinary + save to MongoDB before responding
+    //    This ensures the cache is populated for future requests (especially on Vercel)
+    const title = audioData.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
+    const contentType = audioData.ext === "webm" ? "audio/webm" : "audio/mp4";
+    const responseBuffer = new Uint8Array(audioData.buffer);
+
+    try {
+      const { url, publicId } = await uploadAudio(
+        Buffer.from(audioData.buffer),
+        videoId,
+        audioData.ext
+      );
+      await Song.findOneAndUpdate(
+        { videoId },
+        {
+          videoId,
+          title: audioData.title,
+          cloudinaryUrl: url,
+          cloudinaryPublicId: publicId,
+          ext: audioData.ext,
+          fileSize: audioData.buffer.length,
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+      console.log(`[cache] saved ${videoId} to Cloudinary+MongoDB (${(audioData.buffer.length / 1024 / 1024).toFixed(1)}MB)`);
+    } catch (err) {
+      console.error(`[cache] upload failed for ${videoId}, serving without caching:`, err);
+    }
+
+    // 4. Return audio
+    return new NextResponse(responseBuffer, {
+      status: 200,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Disposition": `attachment; filename="${title}.${audioData.ext}"`,
+        "Content-Length": String(responseBuffer.length),
+      },
+    });
   } catch (error) {
     console.error("Download error:", error);
     return NextResponse.json(
