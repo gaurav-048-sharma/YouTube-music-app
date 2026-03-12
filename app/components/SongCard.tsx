@@ -89,14 +89,15 @@ export default function SongCard({ song, queue }: SongCardProps) {
         return;
       }
 
-      // Not cached — call download endpoint to trigger queueing
+      // Not cached — call download endpoint to trigger queueing / on-the-fly download
       const titleParam = encodeURIComponent(song.title);
       const res = await fetch(
         `/api/download?videoId=${song.videoId}&title=${titleParam}`
       );
 
-      if (res.ok) {
-        // Might have been downloaded on the fly (local server)
+      const ct = res.headers.get("content-type") || "";
+      if (res.ok && (ct.includes("audio") || ct.includes("video"))) {
+        // Actually got audio back (local server downloaded on the fly)
         downloadFile(`/api/download?videoId=${song.videoId}`);
         return;
       }
@@ -104,7 +105,7 @@ export default function SongCard({ song, queue }: SongCardProps) {
       const data = await res.json().catch(() => ({}));
       if (data.code === "QUEUED" || data.code === "NOT_CACHED") {
         setQueued(true);
-        setQueueMsg("Queued for download...");
+        setQueueMsg("Queued — your cache-worker will process it...");
         pollForReady();
       } else {
         alert(data.error || "Download failed");

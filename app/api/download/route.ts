@@ -530,7 +530,7 @@ export async function GET(request: NextRequest) {
           code: "QUEUED",
           status: queueItem?.status || "pending",
         },
-        { status: 202 }
+        { status: 503 }
       );
     }
 
