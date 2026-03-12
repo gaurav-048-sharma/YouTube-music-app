@@ -23,22 +23,16 @@ export default function SongCard({ song, queue }: SongCardProps) {
   };
 
   const downloadFile = useCallback(
-    async (res: Response) => {
-      const disposition = res.headers.get("Content-Disposition");
-      const filenameMatch = disposition?.match(/filename="(.+)"/);
-      const filename =
-        filenameMatch?.[1] ??
-        `${song.title.replace(/[^a-zA-Z0-9 ]/g, "")}.m4a`;
-
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
+    async (downloadUrl: string) => {
+      // Use a hidden link to trigger browser download directly
+      // This avoids blob issues and works with redirects
       const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
+      a.href = downloadUrl;
+      a.download = `${song.title.replace(/[^a-zA-Z0-9 ]/g, "")}.mp3`;
+      a.style.display = "none";
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
     },
     [song.title]
   );
@@ -61,13 +55,8 @@ export default function SongCard({ song, queue }: SongCardProps) {
         if (data.status === "cached") {
           if (pollRef.current) clearInterval(pollRef.current);
           setQueueMsg("Ready! Starting download...");
-          // Now download the cached file
-          const dlRes = await fetch(
-            `/api/download?videoId=${song.videoId}`
-          );
-          if (dlRes.ok) {
-            await downloadFile(dlRes);
-          }
+          // Download the cached file directly via link
+          downloadFile(`/api/download?videoId=${song.videoId}`);
           setQueued(false);
           setQueueMsg("");
         } else if (data.status === "processing") {
@@ -90,19 +79,30 @@ export default function SongCard({ song, queue }: SongCardProps) {
     if (downloading || queued) return;
     setDownloading(true);
     try {
+      // First check if already cached via queue API (fast)
+      const checkRes = await fetch(`/api/queue?videoId=${song.videoId}`);
+      const checkData = await checkRes.json();
+
+      if (checkData.status === "cached") {
+        // Already cached — trigger direct download via link (redirects to Cloudinary)
+        downloadFile(`/api/download?videoId=${song.videoId}`);
+        return;
+      }
+
+      // Not cached — call download endpoint to trigger queueing
       const titleParam = encodeURIComponent(song.title);
       const res = await fetch(
         `/api/download?videoId=${song.videoId}&title=${titleParam}`
       );
 
       if (res.ok) {
-        await downloadFile(res);
+        // Might have been downloaded on the fly (local server)
+        downloadFile(`/api/download?videoId=${song.videoId}`);
         return;
       }
 
       const data = await res.json().catch(() => ({}));
       if (data.code === "QUEUED" || data.code === "NOT_CACHED") {
-        // Song has been queued for download
         setQueued(true);
         setQueueMsg("Queued for download...");
         pollForReady();

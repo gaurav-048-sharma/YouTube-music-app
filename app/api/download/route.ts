@@ -450,17 +450,18 @@ export async function GET(request: NextRequest) {
       console.log(`[download] cache hit for ${videoId}, redirecting to Cloudinary`);
       const title = cached.title.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || videoId;
 
-      // Fetch from Cloudinary and serve with proper headers
-      const cloudRes = await fetch(cached.cloudinaryUrl);
-      if (cloudRes.ok && cloudRes.body) {
-        return new NextResponse(cloudRes.body, {
-          status: 200,
-          headers: {
-            "Content-Type": cached.ext === "webm" ? "audio/webm" : "audio/mp4",
-            "Content-Disposition": `attachment; filename="${title}.${cached.ext}"`,
-            ...(cached.fileSize ? { "Content-Length": String(cached.fileSize) } : {}),
-          },
-        });
+      // Verify Cloudinary URL is still valid with a HEAD request
+      try {
+        const headRes = await fetch(cached.cloudinaryUrl, { method: "HEAD" });
+        if (headRes.ok) {
+          // Redirect directly to Cloudinary — much faster, no proxying
+          const ext = cached.ext || "m4a";
+          // Cloudinary supports fl_attachment for forced download with custom filename
+          const dlUrl = cached.cloudinaryUrl.replace("/upload/", `/upload/fl_attachment:${encodeURIComponent(title)}/`);
+          return NextResponse.redirect(dlUrl, 302);
+        }
+      } catch {
+        // HEAD check failed
       }
       // Cloudinary URL expired/broken — delete stale record and re-download
       console.log(`[download] Cloudinary URL broken for ${videoId}, re-downloading`);
