@@ -259,7 +259,10 @@ export async function GET(request: NextRequest) {
 
     if (!audioData) {
       return NextResponse.json(
-        { error: "Could not download audio for this video. Try a different song." },
+        {
+          error: "This song hasn't been cached yet. It may need to be pre-cached before it can be downloaded.",
+          code: "NOT_CACHED",
+        },
         { status: 404 }
       );
     }

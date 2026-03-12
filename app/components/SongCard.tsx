@@ -25,8 +25,12 @@ export default function SongCard({ song, queue }: SongCardProps) {
     try {
       const res = await fetch(`/api/download?videoId=${song.videoId}`);
       if (!res.ok) {
-        const data = await res.json();
-        alert(data.error || "Download failed");
+        const data = await res.json().catch(() => ({}));
+        if (data.code === "NOT_CACHED") {
+          alert("This song hasn't been cached yet. Only pre-cached songs can be downloaded on the hosted version.");
+        } else {
+          alert(data.error || "Download failed");
+        }
         return;
       }
       const disposition = res.headers.get("Content-Disposition");
