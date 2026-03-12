@@ -8,6 +8,21 @@ const execFileAsync = promisify(execFile);
 
 export const maxDuration = 60;
 
+const YT_COOKIES_PATH = "/tmp/yt-cookies.txt";
+
+/** Write YouTube cookies from env var to disk for yt-dlp. */
+function ensureCookiesFile(): string | null {
+  const b64 = process.env.YT_COOKIES_BASE64;
+  if (!b64) return null;
+  try {
+    const content = Buffer.from(b64, "base64").toString("utf-8");
+    writeFileSync(YT_COOKIES_PATH, content);
+    return YT_COOKIES_PATH;
+  } catch {
+    return null;
+  }
+}
+
 const YT_DLP_TMP = "/tmp/yt-dlp";
 const YT_DLP_BUNDLED = process.cwd() + "/bin/yt-dlp";
 const YT_DLP_URLS = [
@@ -106,14 +121,23 @@ function downloadWithYtDlp(
 ): Promise<{ buffer: Buffer; title: string; ext: string; error?: string } | null> {
   return new Promise((resolve) => {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const cookiesFile = ensureCookiesFile();
 
-    const titlePromise = execFileAsync(ytDlpPath, ["--js-runtimes", "node", "--get-title", url], {
+    const baseArgs = [
+      "--js-runtimes", "node",
+      "--no-cache-dir",
+      "--geo-bypass",
+      "--extractor-args", "youtube:player_client=mediaconnect",
+    ];
+    if (cookiesFile) baseArgs.push("--cookies", cookiesFile);
+
+    const titlePromise = execFileAsync(ytDlpPath, [...baseArgs, "--get-title", url], {
       timeout: 15000,
     })
       .then((r) => r.stdout.trim())
       .catch(() => videoId);
 
-    const child = spawn(ytDlpPath, ["-f", "bestaudio", "-o", "-", "--no-cache-dir", "--js-runtimes", "node", url]);
+    const child = spawn(ytDlpPath, ["-f", "bestaudio", "-o", "-", ...baseArgs, url]);
 
     const chunks: Buffer[] = [];
     const stderrLines: string[] = [];
