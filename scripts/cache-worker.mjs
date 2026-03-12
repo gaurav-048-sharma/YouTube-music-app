@@ -27,7 +27,7 @@ config({ path: ".env" });
 const execFileAsync = promisify(execFile);
 
 const MONGODB_URI = process.env.MONGODB_URI;
-const POLL_INTERVAL = 10_000; // 10 seconds
+const POLL_INTERVAL = 3_000; // 3 seconds
 
 if (!MONGODB_URI) {
   console.error("❌ MONGODB_URI not set. Create .env.local with your MongoDB URI.");

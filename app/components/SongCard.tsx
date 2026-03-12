@@ -42,8 +42,8 @@ export default function SongCard({ song, queue }: SongCardProps) {
     let attempts = 0;
     pollRef.current = setInterval(async () => {
       attempts++;
-      if (attempts > 30) {
-        // Stop after ~5 minutes
+      if (attempts > 60) {
+        // Stop after ~3 minutes
         if (pollRef.current) clearInterval(pollRef.current);
         setQueued(false);
         setQueueMsg("");
@@ -72,7 +72,7 @@ export default function SongCard({ song, queue }: SongCardProps) {
       } catch {
         // ignore poll errors
       }
-    }, 10000);
+    }, 3000);
   }, [song.videoId, downloadFile]);
 
   const handleDownload = async () => {
