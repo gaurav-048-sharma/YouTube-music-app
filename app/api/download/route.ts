@@ -396,7 +396,7 @@ export async function GET(request: NextRequest) {
               "This song is not available for direct public download right now.",
             code: "NOT_CACHED",
           },
-          { status: 404 }
+          { status: 200 }
         );
       }
     } else {
@@ -416,7 +416,7 @@ export async function GET(request: NextRequest) {
           error: "Unable to fetch this song source right now.",
           code: "SOURCE_UNAVAILABLE",
         },
-        { status: 502 }
+        { status: 200 }
       );
     }
 

@@ -14,6 +14,7 @@ export default function SongCard({ song, queue }: SongCardProps) {
   const { playSong, currentSong, isPlaying } = usePlayer();
   const isActive = currentSong?.videoId === song.videoId;
   const [downloading, setDownloading] = useState(false);
+  const [downloadMsg, setDownloadMsg] = useState("");
 
   const handlePlay = () => {
     playSong(song, queue);
@@ -35,18 +36,12 @@ export default function SongCard({ song, queue }: SongCardProps) {
   const handleDownload = async () => {
     if (downloading) return;
     setDownloading(true);
+    setDownloadMsg("");
     try {
-      const checkRes = await fetch(`/api/queue?videoId=${song.videoId}`);
-      const checkData = await checkRes.json().catch(() => ({}));
-
-      if (checkData.status === "cached") {
-        downloadFile(`/api/download?videoId=${song.videoId}`);
-        return;
-      }
-
       const titleParam = encodeURIComponent(song.title);
       const res = await fetch(
-        `/api/download?videoId=${song.videoId}&title=${titleParam}`
+        `/api/download?videoId=${song.videoId}&title=${titleParam}`,
+        { cache: "no-store" }
       );
 
       const ct = res.headers.get("content-type") || "";
@@ -57,14 +52,15 @@ export default function SongCard({ song, queue }: SongCardProps) {
 
       const data = await res.json().catch(() => ({}));
       if (data.code === "NOT_CACHED") {
-        alert("This song is not available for direct public download right now.");
+        setDownloadMsg("This song is not ready for direct download yet.");
       } else {
-        alert(data.error || "Download failed");
+        setDownloadMsg(data.error || "Please try another song.");
       }
     } catch {
-      alert("Download failed.");
+      setDownloadMsg("Please try again in a moment.");
     } finally {
       setDownloading(false);
+      setTimeout(() => setDownloadMsg(""), 4000);
     }
   };
 
@@ -135,6 +131,9 @@ export default function SongCard({ song, queue }: SongCardProps) {
             </svg>
           )}
         </button>
+        {downloadMsg && (
+          <span className="song-card__queue-status">{downloadMsg}</span>
+        )}
       </div>
     </div>
   );
