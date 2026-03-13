@@ -200,6 +200,10 @@ export default function SongCard({ song, queue }: SongCardProps) {
           continue;
         }
 
+        if (retryable) {
+          return;
+        }
+
         setDownloadMsg(data.error || "This track is temporarily unavailable.");
         return;
       }
