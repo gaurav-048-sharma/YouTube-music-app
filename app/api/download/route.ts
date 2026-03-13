@@ -146,85 +146,90 @@ function downloadWithYtDlp(
 async function downloadWithInnertube(
   videoId: string
 ): Promise<AudioData | null> {
-  const clients: Array<"IOS" | "ANDROID" | "WEB"> = ["IOS", "ANDROID", "WEB"];
+  const strategies = [
+    { retrievePlayer: false, clients: ["IOS", "ANDROID", "WEB"] as const },
+    { retrievePlayer: true, clients: ["WEB", "ANDROID"] as const },
+  ];
 
-  try {
-    const yt = await withTimeout(
-      Innertube.create({
-        retrieve_player: false,
-        generate_session_locally: true,
-      }),
-      8000
-    );
+  for (const strategy of strategies) {
+    try {
+      const yt = await withTimeout(
+        Innertube.create({
+          retrieve_player: strategy.retrievePlayer,
+          generate_session_locally: true,
+        }),
+        8000
+      );
 
-    for (const client of clients) {
-      try {
-        const info = await withTimeout(yt.getBasicInfo(videoId, { client }), 9000);
-        const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
-          .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
-          .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+      for (const client of strategy.clients) {
+        try {
+          const info = await withTimeout(yt.getBasicInfo(videoId, { client }), 9000);
+          const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
+            .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
+            .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
 
-        if (audioFormats.length === 0) continue;
+          if (audioFormats.length === 0) continue;
 
-        const fmt = audioFormats[0];
-        const title = info.basic_info.title ?? videoId;
-        const ext = fmt.mime_type?.includes("mp4") ? "m4a" : "webm";
-        const spoofedIp = randomIPv4();
-        const requestHeaders = {
-          "User-Agent": CLIENT_USER_AGENTS[client] || CLIENT_USER_AGENTS.WEB,
-          Referer: `https://www.youtube.com/watch?v=${videoId}`,
-          Origin: "https://www.youtube.com",
-          "Accept-Language": "en-US,en;q=0.9",
-          "X-Forwarded-For": spoofedIp,
-          "X-Real-IP": spoofedIp,
-        };
+          const fmt = audioFormats[0];
+          const title = info.basic_info.title ?? videoId;
+          const ext = fmt.mime_type?.includes("mp4") ? "m4a" : "webm";
+          const spoofedIp = randomIPv4();
+          const requestHeaders = {
+            "User-Agent": CLIENT_USER_AGENTS[client] || CLIENT_USER_AGENTS.WEB,
+            Referer: `https://www.youtube.com/watch?v=${videoId}`,
+            Origin: "https://www.youtube.com",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-Forwarded-For": spoofedIp,
+            "X-Real-IP": spoofedIp,
+          };
 
-        const directRes = await fetchWithTimeout(
-          fmt.url!,
-          { headers: requestHeaders },
-          12000
-        );
-        if (directRes.ok) {
-          const buf = Buffer.from(await directRes.arrayBuffer());
-          if (buf.length > 100000) {
-            return { buffer: buf, title, ext };
+          const directRes = await fetchWithTimeout(
+            fmt.url!,
+            { headers: requestHeaders },
+            12000
+          );
+          if (directRes.ok) {
+            const buf = Buffer.from(await directRes.arrayBuffer());
+            if (buf.length > 100000) {
+              return { buffer: buf, title, ext };
+            }
           }
-        }
 
-        const contentLength = Number(fmt.content_length ?? 0);
-        if (contentLength > 0) {
-          const chunkSize = 1024 * 1024;
-          const chunks: Buffer[] = [];
-          let downloaded = 0;
+          const contentLength = Number(fmt.content_length ?? 0);
+          if (contentLength > 0) {
+            const chunkSize = 1024 * 1024;
+            const chunks: Buffer[] = [];
+            let downloaded = 0;
 
-          while (downloaded < contentLength) {
-            const end = Math.min(downloaded + chunkSize - 1, contentLength - 1);
-            const res = await fetchWithTimeout(
-              fmt.url!,
-              {
-                headers: {
-                  ...requestHeaders,
-                  Range: `bytes=${downloaded}-${end}`,
+            while (downloaded < contentLength) {
+              const end = Math.min(downloaded + chunkSize - 1, contentLength - 1);
+              const res = await fetchWithTimeout(
+                fmt.url!,
+                {
+                  headers: {
+                    ...requestHeaders,
+                    Range: `bytes=${downloaded}-${end}`,
+                  },
                 },
-              },
-              12000
-            );
-            if (!res.ok && res.status !== 206) break;
-            const buf = Buffer.from(await res.arrayBuffer());
-            chunks.push(buf);
-            downloaded += buf.length;
-          }
+                12000
+              );
+              if (!res.ok && res.status !== 206) break;
+              const buf = Buffer.from(await res.arrayBuffer());
+              chunks.push(buf);
+              downloaded += buf.length;
+            }
 
-          if (downloaded >= contentLength) {
-            return { buffer: Buffer.concat(chunks), title, ext };
+            if (downloaded >= contentLength) {
+              return { buffer: Buffer.concat(chunks), title, ext };
+            }
           }
+        } catch {
+          // try next client
         }
-      } catch {
-        // try next client
       }
+    } catch {
+      // try next strategy
     }
-  } catch {
-    // no-op
   }
 
   return null;
