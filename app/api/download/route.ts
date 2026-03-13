@@ -5,14 +5,90 @@ import { existsSync, chmodSync } from "fs";
 import { Innertube } from "youtubei.js";
 import { connectDB } from "@/lib/mongodb";
 import { Song } from "@/lib/models/Song";
+import { AppConfig } from "@/lib/models/AppConfig";
 import { uploadAudio } from "@/lib/cloudinary";
 
 const execFileAsync = promisify(execFile);
 type AudioData = { buffer: Buffer; title: string; ext: string };
+type ProviderName = "cobalt" | "innertube" | "direct-player" | "yt-dlp";
+type ProviderContext = {
+  videoId: string;
+  cfToken?: string;
+  isVercel: boolean;
+  ytDlpPath?: string | null;
+};
+type ProviderDefinition = {
+  name: ProviderName;
+  timeoutMs: number;
+  enabled: (ctx: ProviderContext) => boolean;
+  run: (ctx: ProviderContext) => Promise<AudioData | null>;
+};
+type ProviderStats = {
+  success: number;
+  failure: number;
+  consecutiveFailures: number;
+  lastSuccessAt: number;
+  lastFailureAt: number;
+  cooldownUntil: number;
+};
 
 export const maxDuration = 60;
 
 const YT_DLP_BUNDLED = process.cwd() + "/bin/yt-dlp";
+const providerStats = new Map<ProviderName, ProviderStats>();
+let providerRotation = 0;
+
+function getProviderStats(name: ProviderName): ProviderStats {
+  const existing = providerStats.get(name);
+  if (existing) return existing;
+  const created: ProviderStats = {
+    success: 0,
+    failure: 0,
+    consecutiveFailures: 0,
+    lastSuccessAt: 0,
+    lastFailureAt: 0,
+    cooldownUntil: 0,
+  };
+  providerStats.set(name, created);
+  return created;
+}
+
+function recordProviderResult(name: ProviderName, success: boolean) {
+  const now = Date.now();
+  const stats = getProviderStats(name);
+
+  if (success) {
+    stats.success += 1;
+    stats.consecutiveFailures = 0;
+    stats.lastSuccessAt = now;
+    stats.cooldownUntil = 0;
+    return;
+  }
+
+  stats.failure += 1;
+  stats.consecutiveFailures += 1;
+  stats.lastFailureAt = now;
+
+  if (stats.consecutiveFailures >= 3) {
+    const penaltyMs = Math.min(120_000, stats.consecutiveFailures * 15_000);
+    stats.cooldownUntil = now + penaltyMs;
+  }
+}
+
+function providerScore(name: ProviderName): number {
+  const stats = getProviderStats(name);
+  const now = Date.now();
+
+  if (stats.cooldownUntil > now) return -100;
+
+  const attempts = stats.success + stats.failure;
+  const rate = attempts > 0 ? stats.success / attempts : 0.5;
+  const recencyBonus = stats.lastSuccessAt && now - stats.lastSuccessAt < 300_000 ? 0.2 : 0;
+  const failurePenalty = stats.lastFailureAt && now - stats.lastFailureAt < 60_000 ? 0.2 : 0;
+  const streakPenalty = Math.min(0.4, stats.consecutiveFailures * 0.08);
+
+  return rate + recencyBonus - failurePenalty - streakPenalty;
+}
 
 const CLIENT_USER_AGENTS: Record<string, string> = {
   IOS: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
@@ -404,6 +480,33 @@ async function downloadWithDirectPlayerAPI(videoId: string): Promise<AudioData |
 }
 
 let cobaltSessionCache: { token: string; expAt: number } | null = null;
+const COBALT_SESSION_KEY = "cobalt_session";
+
+async function readPersistentCobaltSession(nowSec: number) {
+  try {
+    const item = await AppConfig.findOne({ key: COBALT_SESSION_KEY }).lean();
+    const token = item?.value?.token;
+    const expAt = Number(item?.value?.expAt ?? 0);
+    if (typeof token === "string" && expAt - 5 > nowSec) {
+      return { token, expAt };
+    }
+  } catch {
+    // ignore persistence read failures
+  }
+  return null;
+}
+
+async function writePersistentCobaltSession(token: string, expAt: number) {
+  try {
+    await AppConfig.findOneAndUpdate(
+      { key: COBALT_SESSION_KEY },
+      { key: COBALT_SESSION_KEY, value: { token, expAt } },
+      { upsert: true, returnDocument: "after" }
+    );
+  } catch {
+    // ignore persistence write failures
+  }
+}
 
 async function getCobaltAuthHeader(
   base: string,
@@ -415,6 +518,12 @@ async function getCobaltAuthHeader(
   const nowSec = Math.floor(Date.now() / 1000);
   if (cobaltSessionCache && cobaltSessionCache.expAt - 5 > nowSec) {
     return `Bearer ${cobaltSessionCache.token}`;
+  }
+
+  const persistedSession = await readPersistentCobaltSession(nowSec);
+  if (persistedSession) {
+    cobaltSessionCache = persistedSession;
+    return `Bearer ${persistedSession.token}`;
   }
 
   if (!turnstileToken) return null;
@@ -443,6 +552,8 @@ async function getCobaltAuthHeader(
       token: data.token,
       expAt: nowSec + (Number.isFinite(expSeconds) && expSeconds > 0 ? expSeconds : 180),
     };
+
+    await writePersistentCobaltSession(cobaltSessionCache.token, cobaltSessionCache.expAt);
 
     return `Bearer ${data.token}`;
   } catch {
@@ -505,6 +616,75 @@ async function downloadWithCobaltWithToken(
   }
 }
 
+function getProviderDefinitions(): ProviderDefinition[] {
+  return [
+    {
+      name: "yt-dlp",
+      timeoutMs: 28_000,
+      enabled: (ctx) => !ctx.isVercel && !!ctx.ytDlpPath,
+      run: (ctx) => downloadWithYtDlp(ctx.videoId, ctx.ytDlpPath!),
+    },
+    {
+      name: "innertube",
+      timeoutMs: 16_000,
+      enabled: () => true,
+      run: (ctx) => downloadWithInnertube(ctx.videoId),
+    },
+    {
+      name: "direct-player",
+      timeoutMs: 16_000,
+      enabled: (ctx) => ctx.isVercel,
+      run: (ctx) => downloadWithDirectPlayerAPI(ctx.videoId),
+    },
+    {
+      name: "cobalt",
+      timeoutMs: 12_000,
+      enabled: (ctx) => !!process.env.COBALT_JWT || !!ctx.cfToken || !!cobaltSessionCache,
+      run: (ctx) => downloadWithCobaltWithToken(ctx.videoId, ctx.cfToken),
+    },
+  ];
+}
+
+function getProviderOrder(ctx: ProviderContext, round: number): ProviderDefinition[] {
+  const candidates = getProviderDefinitions().filter((provider) => provider.enabled(ctx));
+  const ranked = candidates
+    .map((provider) => ({ provider, score: providerScore(provider.name) }))
+    .sort((a, b) => b.score - a.score)
+    .map((item) => item.provider);
+
+  if (ranked.length <= 1) return ranked;
+  const offset = (providerRotation + round) % ranked.length;
+  return [...ranked.slice(offset), ...ranked.slice(0, offset)];
+}
+
+async function runProviderPipeline(ctx: ProviderContext): Promise<AudioData | null> {
+  const rounds = ctx.isVercel ? 2 : 1;
+  const deadline = Date.now() + (ctx.isVercel ? 45_000 : 55_000);
+  providerRotation = (providerRotation + 1) % 10_000;
+
+  for (let round = 0; round < rounds; round++) {
+    const order = getProviderOrder(ctx, round);
+    for (const provider of order) {
+      const remaining = deadline - Date.now();
+      if (remaining < 2_500) return null;
+
+      const timeout = Math.min(provider.timeoutMs, Math.max(2_500, remaining - 500));
+      let result: AudioData | null = null;
+
+      try {
+        result = await withTimeout(provider.run(ctx), timeout);
+      } catch {
+        result = null;
+      }
+
+      recordProviderResult(provider.name, !!result);
+      if (result) return result;
+    }
+  }
+
+  return null;
+}
+
 export async function GET(request: NextRequest) {
   const videoId = request.nextUrl.searchParams.get("videoId");
   const cfToken = request.nextUrl.searchParams.get("cfToken") || undefined;
@@ -540,46 +720,19 @@ export async function GET(request: NextRequest) {
     }
 
     const isVercel = !!process.env.VERCEL;
-    let audioData: AudioData | null = null;
-
-    if (isVercel) {
-      // Try no-queue server extraction paths on public host.
-      audioData = await downloadWithInnertube(videoId);
-
-      if (!audioData) {
-        audioData = await downloadWithDirectPlayerAPI(videoId);
-      }
-
-      if (!audioData) {
-        audioData = await downloadWithCobaltWithToken(videoId, cfToken);
-      }
-
-      if (!audioData) {
-        return NextResponse.json(
-          {
-            error:
-              "This song is not available for direct public download right now.",
-            code: "NOT_CACHED",
-          },
-          { status: 200 }
-        );
-      }
-    } else {
-      const ytDlpPath = await findYtDlp();
-      if (ytDlpPath) {
-        audioData = await downloadWithYtDlp(videoId, ytDlpPath);
-      }
-
-      if (!audioData) {
-        audioData = await downloadWithInnertube(videoId);
-      }
-    }
+    const ytDlpPath = !isVercel ? await findYtDlp() : null;
+    const audioData = await runProviderPipeline({
+      videoId,
+      cfToken,
+      isVercel,
+      ytDlpPath,
+    });
 
     if (!audioData) {
       return NextResponse.json(
         {
-          error: "Unable to fetch this song source right now.",
-          code: "SOURCE_UNAVAILABLE",
+          error: "Direct download is temporarily unavailable for this track.",
+          code: "NOT_AVAILABLE",
         },
         { status: 200 }
       );

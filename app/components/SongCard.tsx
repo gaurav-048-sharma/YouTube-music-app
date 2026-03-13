@@ -18,6 +18,7 @@ type TurnstileApi = {
 
 const TURNSTILE_SITEKEY = "0x4AAAAAAAhUvTuTxLs2HYH4";
 let turnstileScriptPromise: Promise<void> | null = null;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function ensureTurnstileScript(): Promise<void> {
   if (typeof window === "undefined") return Promise.resolve();
@@ -169,28 +170,41 @@ export default function SongCard({ song, queue }: SongCardProps) {
       const tokenParam = turnstileToken
         ? `&cfToken=${encodeURIComponent(turnstileToken)}`
         : "";
-      const res = await fetch(
-        `/api/download?videoId=${song.videoId}&title=${titleParam}${tokenParam}`,
-        { cache: "no-store" }
-      );
+      const maxAttempts = 2;
 
-      const ct = res.headers.get("content-type") || "";
-      if (res.ok && (ct.includes("audio") || ct.includes("video"))) {
-        const blob = await res.blob();
-        if (blob.size > 0) {
-          downloadBlob(blob, pickFilename(res.headers.get("content-disposition")));
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const res = await fetch(
+          `/api/download?videoId=${song.videoId}&title=${titleParam}${tokenParam}`,
+          { cache: "no-store" }
+        );
+
+        const ct = res.headers.get("content-type") || "";
+        if (res.ok && (ct.includes("audio") || ct.includes("video"))) {
+          const blob = await res.blob();
+          if (blob.size > 0) {
+            downloadBlob(blob, pickFilename(res.headers.get("content-disposition")));
+            return;
+          }
+          downloadFile(`/api/download?videoId=${song.videoId}`);
           return;
         }
-        downloadFile(`/api/download?videoId=${song.videoId}`);
+
+        const data = await res.json().catch(() => ({}));
+        const retryable =
+          data.code === "NOT_AVAILABLE" ||
+          data.code === "NOT_CACHED" ||
+          data.code === "SOURCE_UNAVAILABLE";
+
+        if (retryable && attempt < maxAttempts - 1) {
+          await sleep(900);
+          continue;
+        }
+
+        setDownloadMsg(data.error || "This track is temporarily unavailable.");
         return;
       }
 
-      const data = await res.json().catch(() => ({}));
-      if (data.code === "NOT_CACHED") {
-        setDownloadMsg("This song is not ready for direct download yet.");
-      } else {
-        setDownloadMsg(data.error || "Please try another song.");
-      }
+      setDownloadMsg("This track is temporarily unavailable.");
     } catch {
       setDownloadMsg("Please try again in a moment.");
     } finally {
