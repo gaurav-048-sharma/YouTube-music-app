@@ -10,48 +10,7 @@ interface SongCardProps {
   queue: Song[];
 }
 
-type TurnstileApi = {
-  render: (container: HTMLElement, options: Record<string, unknown>) => string | number;
-  execute: (id?: string | number) => void;
-  remove: (id?: string | number) => void;
-};
-
-const TURNSTILE_SITEKEY = "0x4AAAAAAAhUvTuTxLs2HYH4";
-let turnstileScriptPromise: Promise<void> | null = null;
-let turnstileTokenInFlight: Promise<string | null> | null = null;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function ensureTurnstileScript(): Promise<void> {
-  if (typeof window === "undefined") return Promise.resolve();
-  const w = window as Window & { turnstile?: TurnstileApi };
-  if (w.turnstile) return Promise.resolve();
-
-  if (!turnstileScriptPromise) {
-    turnstileScriptPromise = new Promise((resolve, reject) => {
-      const existing = document.querySelector<HTMLScriptElement>(
-        'script[src*="challenges.cloudflare.com/turnstile/v0/api.js"]'
-      );
-
-      if (existing) {
-        existing.addEventListener("load", () => resolve(), { once: true });
-        existing.addEventListener("error", () => reject(new Error("Turnstile failed to load")), {
-          once: true,
-        });
-        return;
-      }
-
-      const script = document.createElement("script");
-      script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
-      script.async = true;
-      script.defer = true;
-      script.onload = () => resolve();
-      script.onerror = () => reject(new Error("Turnstile failed to load"));
-      document.head.appendChild(script);
-    });
-  }
-
-  return turnstileScriptPromise;
-}
 
 export default function SongCard({ song, queue }: SongCardProps) {
   const { playSong, currentSong, isPlaying } = usePlayer();
@@ -88,84 +47,6 @@ export default function SongCard({ song, queue }: SongCardProps) {
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
   }, []);
 
-  const getTurnstileToken = useCallback(async (): Promise<string | null> => {
-    if (turnstileTokenInFlight) {
-      return turnstileTokenInFlight;
-    }
-
-    turnstileTokenInFlight = (async (): Promise<string | null> => {
-      try {
-        await ensureTurnstileScript();
-        const w = window as Window & { turnstile?: TurnstileApi };
-        const turnstile = w.turnstile;
-        if (!turnstile) return null;
-
-        return await new Promise<string | null>((resolve) => {
-          const container = document.createElement("div");
-          container.style.position = "fixed";
-          container.style.left = "-9999px";
-          container.style.top = "-9999px";
-          document.body.appendChild(container);
-
-          let done = false;
-          let timeoutRef = 0;
-          let widgetId: string | number | null = null;
-
-          const finish = (token: string | null) => {
-            if (done) return;
-            done = true;
-
-            if (timeoutRef) {
-              window.clearTimeout(timeoutRef);
-            }
-
-            try {
-              if (widgetId !== null) {
-                turnstile.remove(widgetId);
-              }
-            } catch {
-              // ignore cleanup errors
-            }
-
-            container.remove();
-            resolve(token);
-          };
-
-          widgetId = turnstile.render(container, {
-            sitekey: TURNSTILE_SITEKEY,
-            size: "invisible",
-            execution: "execute",
-            callback: (token: string) => {
-              finish(token || null);
-            },
-            "error-callback": () => {
-              finish(null);
-            },
-            "expired-callback": () => {
-              finish(null);
-            },
-          });
-
-          timeoutRef = window.setTimeout(() => {
-            finish(null);
-          }, 15_000);
-
-          try {
-            turnstile.execute(widgetId);
-          } catch {
-            finish(null);
-          }
-        });
-      } catch {
-        return null;
-      }
-    })().finally(() => {
-      turnstileTokenInFlight = null;
-    });
-
-    return turnstileTokenInFlight;
-  }, []);
-
   const pickFilename = useCallback((contentDisposition: string | null) => {
     const fallback = `${song.title.replace(/[^a-zA-Z0-9 ]/g, "").trim() || song.videoId}.mp3`;
     if (!contentDisposition) return fallback;
@@ -199,10 +80,9 @@ export default function SongCard({ song, queue }: SongCardProps) {
         return;
       }
 
-      const tryDownload = async (token?: string | null) => {
-        const tokenParam = token ? `&cfToken=${encodeURIComponent(token)}` : "";
+      const tryDownload = async () => {
         const res = await fetch(
-          `/api/download?videoId=${song.videoId}&title=${titleParam}${tokenParam}`,
+          `/api/download?videoId=${song.videoId}&title=${titleParam}`,
           { cache: "no-store" }
         );
 
@@ -225,10 +105,14 @@ export default function SongCard({ song, queue }: SongCardProps) {
 
         if (!retryable) {
           setDownloadMsg(data.error || "This track is temporarily unavailable.");
-          return { done: true, retryable: false };
+          return { done: true, retryable: false, error: data.error as string | undefined };
         }
 
-        return { done: false, retryable: true };
+        return {
+          done: false,
+          retryable: true,
+          error: (data.error as string | undefined) || "Direct download is temporarily unavailable for this track.",
+        };
       };
 
       const firstTry = await tryDownload();
@@ -238,15 +122,11 @@ export default function SongCard({ song, queue }: SongCardProps) {
       const secondTry = await tryDownload();
       if (secondTry.done) return;
 
-      const turnstileToken = await getTurnstileToken();
-      if (!turnstileToken) return;
-
-      await sleep(400);
-      const thirdTry = await tryDownload(turnstileToken);
+      await sleep(1400);
+      const thirdTry = await tryDownload();
       if (thirdTry.done) return;
 
-      await sleep(700);
-      await tryDownload(turnstileToken);
+      setDownloadMsg(thirdTry.error || secondTry.error || firstTry.error || "This track is temporarily unavailable.");
     } catch {
       setDownloadMsg("Please try again in a moment.");
     } finally {

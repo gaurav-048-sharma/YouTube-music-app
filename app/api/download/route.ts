@@ -639,7 +639,7 @@ function getProviderDefinitions(): ProviderDefinition[] {
     {
       name: "cobalt",
       timeoutMs: 12_000,
-      enabled: (ctx) => !!process.env.COBALT_JWT || !!ctx.cfToken || !!cobaltSessionCache,
+      enabled: () => true,
       run: (ctx) => downloadWithCobaltWithToken(ctx.videoId, ctx.cfToken),
     },
   ];
