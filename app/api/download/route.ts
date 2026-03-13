@@ -14,6 +14,24 @@ export const maxDuration = 60;
 
 const YT_DLP_BUNDLED = process.cwd() + "/bin/yt-dlp";
 
+const CLIENT_USER_AGENTS: Record<string, string> = {
+  IOS: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+  ANDROID: "com.google.android.youtube/19.29.34 (Linux; U; Android 14) gzip",
+  WEB: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  ANDROID_VR: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L)",
+  ANDROID_MUSIC: "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 14)",
+  ANDROID_TESTSUITE: "com.google.android.youtube/19.29.34 (Linux; U; Android 14)",
+  TVHTML5_SIMPLY_EMBEDDED_PLAYER: "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0)",
+};
+
+function randomIPv4(): string {
+  const a = Math.floor(Math.random() * 223) + 1;
+  const b = Math.floor(Math.random() * 255);
+  const c = Math.floor(Math.random() * 255);
+  const d = Math.floor(Math.random() * 255);
+  return `${a}.${b}.${c}.${d}`;
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
@@ -151,8 +169,21 @@ async function downloadWithInnertube(
         const fmt = audioFormats[0];
         const title = info.basic_info.title ?? videoId;
         const ext = fmt.mime_type?.includes("mp4") ? "m4a" : "webm";
+        const spoofedIp = randomIPv4();
+        const requestHeaders = {
+          "User-Agent": CLIENT_USER_AGENTS[client] || CLIENT_USER_AGENTS.WEB,
+          Referer: `https://www.youtube.com/watch?v=${videoId}`,
+          Origin: "https://www.youtube.com",
+          "Accept-Language": "en-US,en;q=0.9",
+          "X-Forwarded-For": spoofedIp,
+          "X-Real-IP": spoofedIp,
+        };
 
-        const directRes = await fetchWithTimeout(fmt.url!, {}, 12000);
+        const directRes = await fetchWithTimeout(
+          fmt.url!,
+          { headers: requestHeaders },
+          12000
+        );
         if (directRes.ok) {
           const buf = Buffer.from(await directRes.arrayBuffer());
           if (buf.length > 100000) {
@@ -171,7 +202,10 @@ async function downloadWithInnertube(
             const res = await fetchWithTimeout(
               fmt.url!,
               {
-              headers: { Range: `bytes=${downloaded}-${end}` },
+                headers: {
+                  ...requestHeaders,
+                  Range: `bytes=${downloaded}-${end}`,
+                },
               },
               12000
             );
@@ -202,14 +236,35 @@ async function downloadWithDirectPlayerAPI(videoId: string): Promise<AudioData |
       clientName: "ANDROID_VR",
       clientVersion: "1.60.19",
       apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
-      ua: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L)",
+      ua: CLIENT_USER_AGENTS.ANDROID_VR,
       xClientName: "28",
+    },
+    {
+      clientName: "ANDROID_MUSIC",
+      clientVersion: "7.27.52",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: CLIENT_USER_AGENTS.ANDROID_MUSIC,
+      xClientName: "21",
+    },
+    {
+      clientName: "ANDROID_TESTSUITE",
+      clientVersion: "1.9",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: CLIENT_USER_AGENTS.ANDROID_TESTSUITE,
+      xClientName: "30",
+    },
+    {
+      clientName: "ANDROID",
+      clientVersion: "19.29.34",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: CLIENT_USER_AGENTS.ANDROID,
+      xClientName: "3",
     },
     {
       clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
       clientVersion: "2.0",
       apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
-      ua: "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0)",
+      ua: CLIENT_USER_AGENTS.TVHTML5_SIMPLY_EMBEDDED_PLAYER,
       xClientName: "85",
     },
   ];
@@ -236,6 +291,8 @@ async function downloadWithDirectPlayerAPI(videoId: string): Promise<AudioData |
         };
       }
 
+      const spoofedIp = randomIPv4();
+
       const res = await fetchWithTimeout(
         `https://www.youtube.com/youtubei/v1/player?key=${client.apiKey}&prettyPrint=false`,
         {
@@ -245,6 +302,13 @@ async function downloadWithDirectPlayerAPI(videoId: string): Promise<AudioData |
             "User-Agent": client.ua,
             "X-YouTube-Client-Name": client.xClientName,
             "X-YouTube-Client-Version": client.clientVersion,
+            Referer: `https://www.youtube.com/watch?v=${videoId}`,
+            Origin: "https://www.youtube.com",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-Forwarded-For": spoofedIp,
+            "X-Real-IP": spoofedIp,
+            "Client-IP": spoofedIp,
+            "X-Originating-IP": spoofedIp,
           },
           body: JSON.stringify(body),
         },
@@ -271,10 +335,56 @@ async function downloadWithDirectPlayerAPI(videoId: string): Promise<AudioData |
       const ext = fmt.mimeType?.includes("mp4") ? "m4a" : "webm";
       const audioRes = await fetchWithTimeout(
         fmt.url,
-        { headers: { "User-Agent": client.ua } },
+        {
+          headers: {
+            "User-Agent": client.ua,
+            Referer: `https://www.youtube.com/watch?v=${videoId}`,
+            Origin: "https://www.youtube.com",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-Forwarded-For": spoofedIp,
+            "X-Real-IP": spoofedIp,
+          },
+        },
         12000
       );
-      if (!audioRes.ok) continue;
+      if (!audioRes.ok) {
+        const cl = fmt.contentLength ? parseInt(fmt.contentLength, 10) : 0;
+        if (cl <= 0) continue;
+
+        const chunkSize = 1024 * 1024;
+        const chunks: Buffer[] = [];
+        let downloaded = 0;
+
+        while (downloaded < cl) {
+          const end = Math.min(downloaded + chunkSize - 1, cl - 1);
+          const chunkRes = await fetchWithTimeout(
+            fmt.url,
+            {
+              headers: {
+                "User-Agent": client.ua,
+                Referer: `https://www.youtube.com/watch?v=${videoId}`,
+                Origin: "https://www.youtube.com",
+                Range: `bytes=${downloaded}-${end}`,
+                "X-Forwarded-For": spoofedIp,
+                "X-Real-IP": spoofedIp,
+              },
+            },
+            12000
+          );
+          if (!chunkRes.ok && chunkRes.status !== 206) break;
+          const buf = Buffer.from(await chunkRes.arrayBuffer());
+          if (!buf.length) break;
+          chunks.push(buf);
+          downloaded += buf.length;
+        }
+
+        if (downloaded >= cl && chunks.length) {
+          const title = data.videoDetails?.title ?? videoId;
+          return { buffer: Buffer.concat(chunks), title, ext };
+        }
+
+        continue;
+      }
 
       const buf = Buffer.from(await audioRes.arrayBuffer());
       if (buf.length > 100000) {
