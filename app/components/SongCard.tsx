@@ -44,14 +44,6 @@ export default function SongCard({ song, queue }: SongCardProps) {
         return;
       }
 
-      // On public deployments, avoid calling /api/download for known uncached songs.
-      const host = window.location.hostname;
-      const isLocal = host === "localhost" || host === "127.0.0.1";
-      if (!isLocal && checkData.status === "not_found") {
-        alert("This song is not cached on the public server yet.");
-        return;
-      }
-
       const titleParam = encodeURIComponent(song.title);
       const res = await fetch(
         `/api/download?videoId=${song.videoId}&title=${titleParam}`
@@ -65,7 +57,7 @@ export default function SongCard({ song, queue }: SongCardProps) {
 
       const data = await res.json().catch(() => ({}));
       if (data.code === "NOT_CACHED") {
-        alert("This song is not cached on the public server yet.");
+        alert("This song is not available for direct public download right now.");
       } else {
         alert(data.error || "Download failed");
       }

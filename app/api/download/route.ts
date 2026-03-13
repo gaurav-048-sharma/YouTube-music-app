@@ -8,10 +8,40 @@ import { Song } from "@/lib/models/Song";
 import { uploadAudio } from "@/lib/cloudinary";
 
 const execFileAsync = promisify(execFile);
+type AudioData = { buffer: Buffer; title: string; ext: string };
 
 export const maxDuration = 60;
 
 const YT_DLP_BUNDLED = process.cwd() + "/bin/yt-dlp";
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs = 12000
+) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function findYtDlp(): Promise<string | null> {
   if (process.env.YT_DLP_PATH) {
@@ -46,7 +76,7 @@ async function findYtDlp(): Promise<string | null> {
 function downloadWithYtDlp(
   videoId: string,
   ytDlpPath: string
-): Promise<{ buffer: Buffer; title: string; ext: string } | null> {
+): Promise<AudioData | null> {
   return new Promise((resolve) => {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
     const args = [
@@ -97,18 +127,21 @@ function downloadWithYtDlp(
 
 async function downloadWithInnertube(
   videoId: string
-): Promise<{ buffer: Buffer; title: string; ext: string } | null> {
+): Promise<AudioData | null> {
   const clients: Array<"IOS" | "ANDROID" | "WEB"> = ["IOS", "ANDROID", "WEB"];
 
   try {
-    const yt = await Innertube.create({
-      retrieve_player: false,
-      generate_session_locally: true,
-    });
+    const yt = await withTimeout(
+      Innertube.create({
+        retrieve_player: false,
+        generate_session_locally: true,
+      }),
+      8000
+    );
 
     for (const client of clients) {
       try {
-        const info = await yt.getBasicInfo(videoId, { client });
+        const info = await withTimeout(yt.getBasicInfo(videoId, { client }), 9000);
         const audioFormats = (info.streaming_data?.adaptive_formats ?? [])
           .filter((f) => f.mime_type?.startsWith("audio/") && f.url)
           .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
@@ -119,7 +152,7 @@ async function downloadWithInnertube(
         const title = info.basic_info.title ?? videoId;
         const ext = fmt.mime_type?.includes("mp4") ? "m4a" : "webm";
 
-        const directRes = await fetch(fmt.url!);
+        const directRes = await fetchWithTimeout(fmt.url!, {}, 12000);
         if (directRes.ok) {
           const buf = Buffer.from(await directRes.arrayBuffer());
           if (buf.length > 100000) {
@@ -135,9 +168,13 @@ async function downloadWithInnertube(
 
           while (downloaded < contentLength) {
             const end = Math.min(downloaded + chunkSize - 1, contentLength - 1);
-            const res = await fetch(fmt.url!, {
+            const res = await fetchWithTimeout(
+              fmt.url!,
+              {
               headers: { Range: `bytes=${downloaded}-${end}` },
-            });
+              },
+              12000
+            );
             if (!res.ok && res.status !== 206) break;
             const buf = Buffer.from(await res.arrayBuffer());
             chunks.push(buf);
@@ -157,6 +194,151 @@ async function downloadWithInnertube(
   }
 
   return null;
+}
+
+async function downloadWithDirectPlayerAPI(videoId: string): Promise<AudioData | null> {
+  const clients = [
+    {
+      clientName: "ANDROID_VR",
+      clientVersion: "1.60.19",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L)",
+      xClientName: "28",
+    },
+    {
+      clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+      clientVersion: "2.0",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      ua: "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0)",
+      xClientName: "85",
+    },
+  ];
+
+  for (const client of clients) {
+    try {
+      const body: Record<string, unknown> = {
+        videoId,
+        context: {
+          client: {
+            clientName: client.clientName,
+            clientVersion: client.clientVersion,
+            hl: "en",
+            gl: "US",
+          },
+        },
+        contentCheckOk: true,
+        racyCheckOk: true,
+      };
+
+      if (client.clientName === "TVHTML5_SIMPLY_EMBEDDED_PLAYER") {
+        (body.context as Record<string, unknown>).thirdParty = {
+          embedUrl: "https://www.youtube.com",
+        };
+      }
+
+      const res = await fetchWithTimeout(
+        `https://www.youtube.com/youtubei/v1/player?key=${client.apiKey}&prettyPrint=false`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": client.ua,
+            "X-YouTube-Client-Name": client.xClientName,
+            "X-YouTube-Client-Version": client.clientVersion,
+          },
+          body: JSON.stringify(body),
+        },
+        9000
+      );
+
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.playabilityStatus?.status !== "OK") continue;
+
+      const title = data.videoDetails?.title ?? videoId;
+      const formats = [
+        ...(data.streamingData?.adaptiveFormats ?? []),
+        ...(data.streamingData?.formats ?? []),
+      ];
+
+      const audioFormats = formats
+        .filter((f: { mimeType?: string; url?: string }) => f.mimeType?.startsWith("audio/") && f.url)
+        .sort((a: { bitrate?: number }, b: { bitrate?: number }) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+
+      if (!audioFormats.length) continue;
+
+      const fmt = audioFormats[0];
+      const ext = fmt.mimeType?.includes("mp4") ? "m4a" : "webm";
+      const audioRes = await fetchWithTimeout(
+        fmt.url,
+        { headers: { "User-Agent": client.ua } },
+        12000
+      );
+      if (!audioRes.ok) continue;
+
+      const buf = Buffer.from(await audioRes.arrayBuffer());
+      if (buf.length > 100000) {
+        return { buffer: buf, title, ext };
+      }
+    } catch {
+      // try next client
+    }
+  }
+
+  return null;
+}
+
+async function downloadWithCobalt(videoId: string): Promise<AudioData | null> {
+  const jwt = process.env.COBALT_JWT;
+  if (!jwt) return null;
+
+  const base = (process.env.COBALT_API_URL || "https://api.cobalt.tools").replace(/\/+$/, "");
+
+  try {
+    const res = await fetchWithTimeout(
+      `${base}/`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Bearer ${jwt}`,
+        },
+        body: JSON.stringify({
+          url: `https://www.youtube.com/watch?v=${videoId}`,
+          downloadMode: "audio",
+          audioFormat: "mp3",
+        }),
+      },
+      10000
+    );
+
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    let mediaUrl: string | undefined;
+    if (data.status === "tunnel" || data.status === "redirect") {
+      mediaUrl = data.url;
+    } else if (data.status === "picker" && Array.isArray(data.picker)) {
+      const audioOption = data.picker.find((p: { type?: string }) => p.type === "audio");
+      mediaUrl = audioOption?.url;
+    }
+
+    if (!mediaUrl) return null;
+
+    const audioRes = await fetchWithTimeout(mediaUrl, {}, 15000);
+    if (!audioRes.ok) return null;
+
+    const buf = Buffer.from(await audioRes.arrayBuffer());
+    if (buf.length < 100000) return null;
+
+    const cd = audioRes.headers.get("content-disposition") || "";
+    const match = cd.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+    const title = match ? decodeURIComponent(match[1]).replace(/\.\w+$/, "") : videoId;
+    return { buffer: buf, title, ext: "mp3" };
+  } catch {
+    return null;
+  }
 }
 
 export async function GET(request: NextRequest) {
@@ -193,26 +375,39 @@ export async function GET(request: NextRequest) {
     }
 
     const isVercel = !!process.env.VERCEL;
+    let audioData: AudioData | null = null;
+
     if (isVercel) {
-      return NextResponse.json(
-        {
-          error:
-            "This song is not cached on the public server yet. Try another song.",
-          code: "NOT_CACHED",
-        },
-        { status: 404 }
-      );
-    }
-
-    let audioData: { buffer: Buffer; title: string; ext: string } | null = null;
-
-    const ytDlpPath = await findYtDlp();
-    if (ytDlpPath) {
-      audioData = await downloadWithYtDlp(videoId, ytDlpPath);
-    }
-
-    if (!audioData) {
+      // Try no-queue server extraction paths on public host.
       audioData = await downloadWithInnertube(videoId);
+
+      if (!audioData) {
+        audioData = await downloadWithDirectPlayerAPI(videoId);
+      }
+
+      if (!audioData) {
+        audioData = await downloadWithCobalt(videoId);
+      }
+
+      if (!audioData) {
+        return NextResponse.json(
+          {
+            error:
+              "This song is not available for direct public download right now.",
+            code: "NOT_CACHED",
+          },
+          { status: 404 }
+        );
+      }
+    } else {
+      const ytDlpPath = await findYtDlp();
+      if (ytDlpPath) {
+        audioData = await downloadWithYtDlp(videoId, ytDlpPath);
+      }
+
+      if (!audioData) {
+        audioData = await downloadWithInnertube(videoId);
+      }
     }
 
     if (!audioData) {
