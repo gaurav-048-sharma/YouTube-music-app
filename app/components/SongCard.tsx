@@ -18,6 +18,7 @@ type TurnstileApi = {
 
 const TURNSTILE_SITEKEY = "0x4AAAAAAAhUvTuTxLs2HYH4";
 let turnstileScriptPromise: Promise<void> | null = null;
+let turnstileTokenInFlight: Promise<string | null> | null = null;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function ensureTurnstileScript(): Promise<void> {
@@ -88,58 +89,81 @@ export default function SongCard({ song, queue }: SongCardProps) {
   }, []);
 
   const getTurnstileToken = useCallback(async (): Promise<string | null> => {
-    try {
-      await ensureTurnstileScript();
-      const w = window as Window & { turnstile?: TurnstileApi };
-      const turnstile = w.turnstile;
-      if (!turnstile) return null;
-
-      return await new Promise((resolve) => {
-        const container = document.createElement("div");
-        container.style.position = "fixed";
-        container.style.left = "-9999px";
-        container.style.top = "-9999px";
-        document.body.appendChild(container);
-
-        const cleanup = (id?: string | number) => {
-          try {
-            if (id !== undefined) turnstile.remove(id);
-          } catch {
-            // ignore cleanup errors
-          }
-          container.remove();
-        };
-
-        const widgetId = turnstile.render(container, {
-          sitekey: TURNSTILE_SITEKEY,
-          size: "invisible",
-          callback: (token: string) => {
-            window.clearTimeout(timeoutRef);
-            cleanup(widgetId);
-            resolve(token || null);
-          },
-          "error-callback": () => {
-            window.clearTimeout(timeoutRef);
-            cleanup(widgetId);
-            resolve(null);
-          },
-          "expired-callback": () => {
-            window.clearTimeout(timeoutRef);
-            cleanup(widgetId);
-            resolve(null);
-          },
-        });
-
-        const timeoutRef = window.setTimeout(() => {
-          cleanup(widgetId);
-          resolve(null);
-        }, 15_000);
-
-        turnstile.execute(widgetId);
-      });
-    } catch {
-      return null;
+    if (turnstileTokenInFlight) {
+      return turnstileTokenInFlight;
     }
+
+    turnstileTokenInFlight = (async (): Promise<string | null> => {
+      try {
+        await ensureTurnstileScript();
+        const w = window as Window & { turnstile?: TurnstileApi };
+        const turnstile = w.turnstile;
+        if (!turnstile) return null;
+
+        return await new Promise<string | null>((resolve) => {
+          const container = document.createElement("div");
+          container.style.position = "fixed";
+          container.style.left = "-9999px";
+          container.style.top = "-9999px";
+          document.body.appendChild(container);
+
+          let done = false;
+          let timeoutRef = 0;
+          let widgetId: string | number | null = null;
+
+          const finish = (token: string | null) => {
+            if (done) return;
+            done = true;
+
+            if (timeoutRef) {
+              window.clearTimeout(timeoutRef);
+            }
+
+            try {
+              if (widgetId !== null) {
+                turnstile.remove(widgetId);
+              }
+            } catch {
+              // ignore cleanup errors
+            }
+
+            container.remove();
+            resolve(token);
+          };
+
+          widgetId = turnstile.render(container, {
+            sitekey: TURNSTILE_SITEKEY,
+            size: "invisible",
+            execution: "execute",
+            callback: (token: string) => {
+              finish(token || null);
+            },
+            "error-callback": () => {
+              finish(null);
+            },
+            "expired-callback": () => {
+              finish(null);
+            },
+          });
+
+          timeoutRef = window.setTimeout(() => {
+            finish(null);
+          }, 15_000);
+
+          try {
+            turnstile.execute(widgetId);
+          } catch {
+            finish(null);
+          }
+        });
+      } catch {
+        return null;
+      }
+    })().finally(() => {
+      turnstileTokenInFlight = null;
+    });
+
+    return turnstileTokenInFlight;
   }, []);
 
   const pickFilename = useCallback((contentDisposition: string | null) => {
@@ -164,15 +188,19 @@ export default function SongCard({ song, queue }: SongCardProps) {
     if (downloading) return;
     setDownloading(true);
     setDownloadMsg("");
-    try {
-      const turnstileToken = await getTurnstileToken();
-      const titleParam = encodeURIComponent(song.title);
-      const tokenParam = turnstileToken
-        ? `&cfToken=${encodeURIComponent(turnstileToken)}`
-        : "";
-      const maxAttempts = 2;
 
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const titleParam = encodeURIComponent(song.title);
+
+      const checkRes = await fetch(`/api/queue?videoId=${song.videoId}`);
+      const checkData = await checkRes.json().catch(() => ({}));
+      if (checkData.status === "cached") {
+        downloadFile(`/api/download?videoId=${song.videoId}`);
+        return;
+      }
+
+      const tryDownload = async (token?: string | null) => {
+        const tokenParam = token ? `&cfToken=${encodeURIComponent(token)}` : "";
         const res = await fetch(
           `/api/download?videoId=${song.videoId}&title=${titleParam}${tokenParam}`,
           { cache: "no-store" }
@@ -183,10 +211,10 @@ export default function SongCard({ song, queue }: SongCardProps) {
           const blob = await res.blob();
           if (blob.size > 0) {
             downloadBlob(blob, pickFilename(res.headers.get("content-disposition")));
-            return;
+            return { done: true, retryable: false };
           }
           downloadFile(`/api/download?videoId=${song.videoId}`);
-          return;
+          return { done: true, retryable: false };
         }
 
         const data = await res.json().catch(() => ({}));
@@ -195,20 +223,30 @@ export default function SongCard({ song, queue }: SongCardProps) {
           data.code === "NOT_CACHED" ||
           data.code === "SOURCE_UNAVAILABLE";
 
-        if (retryable && attempt < maxAttempts - 1) {
-          await sleep(900);
-          continue;
+        if (!retryable) {
+          setDownloadMsg(data.error || "This track is temporarily unavailable.");
+          return { done: true, retryable: false };
         }
 
-        if (retryable) {
-          return;
-        }
+        return { done: false, retryable: true };
+      };
 
-        setDownloadMsg(data.error || "This track is temporarily unavailable.");
-        return;
-      }
+      const firstTry = await tryDownload();
+      if (firstTry.done) return;
 
-      setDownloadMsg("This track is temporarily unavailable.");
+      await sleep(900);
+      const secondTry = await tryDownload();
+      if (secondTry.done) return;
+
+      const turnstileToken = await getTurnstileToken();
+      if (!turnstileToken) return;
+
+      await sleep(400);
+      const thirdTry = await tryDownload(turnstileToken);
+      if (thirdTry.done) return;
+
+      await sleep(700);
+      await tryDownload(turnstileToken);
     } catch {
       setDownloadMsg("Please try again in a moment.");
     } finally {
