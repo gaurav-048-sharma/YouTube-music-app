@@ -403,11 +403,60 @@ async function downloadWithDirectPlayerAPI(videoId: string): Promise<AudioData |
   return null;
 }
 
-async function downloadWithCobalt(videoId: string): Promise<AudioData | null> {
-  const jwt = process.env.COBALT_JWT;
-  if (!jwt) return null;
+let cobaltSessionCache: { token: string; expAt: number } | null = null;
 
+async function getCobaltAuthHeader(
+  base: string,
+  turnstileToken?: string
+): Promise<string | null> {
+  const staticJwt = process.env.COBALT_JWT;
+  if (staticJwt) return `Bearer ${staticJwt}`;
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (cobaltSessionCache && cobaltSessionCache.expAt - 5 > nowSec) {
+    return `Bearer ${cobaltSessionCache.token}`;
+  }
+
+  if (!turnstileToken) return null;
+
+  try {
+    const res = await fetchWithTimeout(
+      `${base}/session`,
+      {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          "cf-turnstile-response": turnstileToken,
+          Origin: "https://cobalt.tools",
+          Referer: "https://cobalt.tools/",
+        },
+      },
+      10000
+    );
+
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    if (!data?.token || typeof data.token !== "string") return null;
+
+    const expSeconds = Number(data.exp ?? 0);
+    cobaltSessionCache = {
+      token: data.token,
+      expAt: nowSec + (Number.isFinite(expSeconds) && expSeconds > 0 ? expSeconds : 180),
+    };
+
+    return `Bearer ${data.token}`;
+  } catch {
+    return null;
+  }
+}
+
+async function downloadWithCobaltWithToken(
+  videoId: string,
+  turnstileToken?: string
+): Promise<AudioData | null> {
   const base = (process.env.COBALT_API_URL || "https://api.cobalt.tools").replace(/\/+$/, "");
+  const authHeader = await getCobaltAuthHeader(base, turnstileToken);
+  if (!authHeader) return null;
 
   try {
     const res = await fetchWithTimeout(
@@ -417,7 +466,7 @@ async function downloadWithCobalt(videoId: string): Promise<AudioData | null> {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
-          Authorization: `Bearer ${jwt}`,
+          Authorization: authHeader,
         },
         body: JSON.stringify({
           url: `https://www.youtube.com/watch?v=${videoId}`,
@@ -458,6 +507,7 @@ async function downloadWithCobalt(videoId: string): Promise<AudioData | null> {
 
 export async function GET(request: NextRequest) {
   const videoId = request.nextUrl.searchParams.get("videoId");
+  const cfToken = request.nextUrl.searchParams.get("cfToken") || undefined;
 
   if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
     return NextResponse.json(
@@ -501,7 +551,7 @@ export async function GET(request: NextRequest) {
       }
 
       if (!audioData) {
-        audioData = await downloadWithCobalt(videoId);
+        audioData = await downloadWithCobaltWithToken(videoId, cfToken);
       }
 
       if (!audioData) {

@@ -10,6 +10,47 @@ interface SongCardProps {
   queue: Song[];
 }
 
+type TurnstileApi = {
+  render: (container: HTMLElement, options: Record<string, unknown>) => string | number;
+  execute: (id?: string | number) => void;
+  remove: (id?: string | number) => void;
+};
+
+const TURNSTILE_SITEKEY = "0x4AAAAAAAhUvTuTxLs2HYH4";
+let turnstileScriptPromise: Promise<void> | null = null;
+
+function ensureTurnstileScript(): Promise<void> {
+  if (typeof window === "undefined") return Promise.resolve();
+  const w = window as Window & { turnstile?: TurnstileApi };
+  if (w.turnstile) return Promise.resolve();
+
+  if (!turnstileScriptPromise) {
+    turnstileScriptPromise = new Promise((resolve, reject) => {
+      const existing = document.querySelector<HTMLScriptElement>(
+        'script[src*="challenges.cloudflare.com/turnstile/v0/api.js"]'
+      );
+
+      if (existing) {
+        existing.addEventListener("load", () => resolve(), { once: true });
+        existing.addEventListener("error", () => reject(new Error("Turnstile failed to load")), {
+          once: true,
+        });
+        return;
+      }
+
+      const script = document.createElement("script");
+      script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+      script.async = true;
+      script.defer = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Turnstile failed to load"));
+      document.head.appendChild(script);
+    });
+  }
+
+  return turnstileScriptPromise;
+}
+
 export default function SongCard({ song, queue }: SongCardProps) {
   const { playSong, currentSong, isPlaying } = usePlayer();
   const isActive = currentSong?.videoId === song.videoId;
@@ -33,19 +74,113 @@ export default function SongCard({ song, queue }: SongCardProps) {
     [song.title]
   );
 
+  const downloadBlob = useCallback((blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  }, []);
+
+  const getTurnstileToken = useCallback(async (): Promise<string | null> => {
+    try {
+      await ensureTurnstileScript();
+      const w = window as Window & { turnstile?: TurnstileApi };
+      const turnstile = w.turnstile;
+      if (!turnstile) return null;
+
+      return await new Promise((resolve) => {
+        const container = document.createElement("div");
+        container.style.position = "fixed";
+        container.style.left = "-9999px";
+        container.style.top = "-9999px";
+        document.body.appendChild(container);
+
+        const cleanup = (id?: string | number) => {
+          try {
+            if (id !== undefined) turnstile.remove(id);
+          } catch {
+            // ignore cleanup errors
+          }
+          container.remove();
+        };
+
+        const widgetId = turnstile.render(container, {
+          sitekey: TURNSTILE_SITEKEY,
+          size: "invisible",
+          callback: (token: string) => {
+            window.clearTimeout(timeoutRef);
+            cleanup(widgetId);
+            resolve(token || null);
+          },
+          "error-callback": () => {
+            window.clearTimeout(timeoutRef);
+            cleanup(widgetId);
+            resolve(null);
+          },
+          "expired-callback": () => {
+            window.clearTimeout(timeoutRef);
+            cleanup(widgetId);
+            resolve(null);
+          },
+        });
+
+        const timeoutRef = window.setTimeout(() => {
+          cleanup(widgetId);
+          resolve(null);
+        }, 15_000);
+
+        turnstile.execute(widgetId);
+      });
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const pickFilename = useCallback((contentDisposition: string | null) => {
+    const fallback = `${song.title.replace(/[^a-zA-Z0-9 ]/g, "").trim() || song.videoId}.mp3`;
+    if (!contentDisposition) return fallback;
+
+    const starMatch = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (starMatch?.[1]) {
+      try {
+        return decodeURIComponent(starMatch[1]);
+      } catch {
+        return starMatch[1];
+      }
+    }
+
+    const plainMatch = contentDisposition.match(/filename="?([^";]+)"?/i);
+    if (plainMatch?.[1]) return plainMatch[1];
+    return fallback;
+  }, [song.title, song.videoId]);
+
   const handleDownload = async () => {
     if (downloading) return;
     setDownloading(true);
     setDownloadMsg("");
     try {
+      const turnstileToken = await getTurnstileToken();
       const titleParam = encodeURIComponent(song.title);
+      const tokenParam = turnstileToken
+        ? `&cfToken=${encodeURIComponent(turnstileToken)}`
+        : "";
       const res = await fetch(
-        `/api/download?videoId=${song.videoId}&title=${titleParam}`,
+        `/api/download?videoId=${song.videoId}&title=${titleParam}${tokenParam}`,
         { cache: "no-store" }
       );
 
       const ct = res.headers.get("content-type") || "";
       if (res.ok && (ct.includes("audio") || ct.includes("video"))) {
+        const blob = await res.blob();
+        if (blob.size > 0) {
+          downloadBlob(blob, pickFilename(res.headers.get("content-disposition")));
+          return;
+        }
         downloadFile(`/api/download?videoId=${song.videoId}`);
         return;
       }
